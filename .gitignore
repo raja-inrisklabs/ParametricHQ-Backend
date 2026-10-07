@@ -3,5 +3,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Secrets. Keep .env.example.
 .env
+.env*.local
+
+# Fetched datasets, catalog, and job records.
 storage/

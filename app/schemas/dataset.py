@@ -1,9 +1,14 @@
-from typing import Optional, Dict, Any, List, Union
+import datetime
+from typing import Optional, Dict, Any, List, Tuple, Union
 from pydantic import BaseModel, Field, model_validator
 
 
 class DatasetRequest(BaseModel):
     provider_id: str = Field(..., description="Provider identifier (e.g. 'era5')")
+    dataset_id: Optional[str] = Field(
+        None,
+        description="Catalog dataset, e.g. 'reanalysis-era5-land'. Fetches one day, all hours, all catalog variables.",
+    )
     parameter_type: Optional[str] = Field(
         None,
         description="Single parameter name, e.g. 'total_precipitation' or 'rainfall' (backward compatible)"
@@ -23,14 +28,66 @@ class DatasetRequest(BaseModel):
     # Optional precise coordinates override
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # CDS area order is [north, west, south, east]
+    north: Optional[float] = Field(None, ge=-90, le=90)
+    west: Optional[float] = Field(None, ge=-180, le=180)
+    south: Optional[float] = Field(None, ge=-90, le=90)
+    east: Optional[float] = Field(None, ge=-180, le=180)
 
     @model_validator(mode="after")
     def validate_parameters(self):
+        bounds = (self.north, self.west, self.south, self.east)
+        if any(value is not None for value in bounds) and not all(value is not None for value in bounds):
+            raise ValueError("Provide north, west, south, and east together.")
+        if self.north is not None and self.south is not None and self.north <= self.south:
+            raise ValueError("North must be greater than south.")
+        if self.west is not None and self.east is not None and self.west >= self.east:
+            raise ValueError("West must be less than east.")
+        if self.dataset_id:
+            start = datetime.datetime.strptime(self.start_date, "%Y-%m-%d")
+            end = datetime.datetime.strptime(self.end_date, "%Y-%m-%d")
+            if end < start:
+                raise ValueError("end_date must be on or after start_date.")
+            day_count = (end - start).days + 1
+            if day_count > 366:
+                raise ValueError("Date range is limited to 366 days.")
+            selected = self.parameters or []
+            if selected and day_count > 31 and len(selected) > 5:
+                raise ValueError("A range longer than 31 days can include at most 5 variables.")
+            return self
         if not self.parameters and not self.parameter_type:
             raise ValueError("Either 'parameter_type' (single string) or 'parameters' (list of variables) must be provided.")
         if self.parameters and not self.parameter_type:
             self.parameter_type = self.parameters[0] if len(self.parameters) == 1 else "multi_parameter"
         return self
+
+    def is_point(self) -> bool:
+        return self.latitude is not None and self.longitude is not None and self.north is None
+
+    def grid_step(self) -> float:
+        """Native cell size. ERA5-Land is 0.1 degree. ERA5 single levels is 0.25 degree."""
+        if self.dataset_id == "reanalysis-era5-single-levels":
+            return 0.25
+        return 0.1
+
+    def snapped_point(self) -> Optional[Tuple[float, float]]:
+        """Nearest native grid cell. A 0.1 degree grid turns 23.06 into 23.1."""
+        if self.latitude is None or self.longitude is None:
+            return None
+        step = self.grid_step()
+        lat = round(round(float(self.latitude) / step) * step, 2)
+        lon = round(round(float(self.longitude) / step) * step, 2)
+        return lat, lon
+
+    def cds_area(self) -> List[float]:
+        """CDS order: north, west, south, east. A point uses its native grid cell."""
+        if self.is_point():
+            lat, lon = self.snapped_point()
+            half = self.grid_step() / 2
+            return [round(lat + half, 2), round(lon - half, 2), round(lat - half, 2), round(lon + half, 2)]
+        if self.north is None:
+            return [20.0, 10.0, 10.0, 20.0]
+        return [float(self.north), float(self.west), float(self.south), float(self.east)]
 
     @property
     def requested_parameters(self) -> List[str]:

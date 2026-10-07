@@ -1,3 +1,18 @@
+def _wait_for_job(client, payload):
+    accepted = client.post("/api/v1/datasets/request", json=payload)
+    if accepted.status_code == 200:
+        return accepted
+    assert accepted.status_code == 202
+    body = accepted.json()
+    final = accepted
+    for _ in range(80):
+        final = client.get(f"/api/v1/datasets/jobs/{body['job_id']}")
+        if final.json().get("status") in ("ready", "failed"):
+            return final
+        __import__("time").sleep(0.05)
+    return final
+
+
 def test_dataset_analysis_endpoint(client):
     # Setup dataset
     setup_req = {
@@ -6,13 +21,14 @@ def test_dataset_analysis_endpoint(client):
         "location": "gujarat/ahmedabad",
         "start_date": "2025-05-01",
         "end_date": "2025-07-31",
+        "temporal_resolution": "daily",
     }
-    setup_res = client.post("/api/datasets/request", json=setup_req)
+    setup_res = _wait_for_job(client, setup_req)
     assert setup_res.status_code == 200
     data_key = setup_res.json()["data_key"]
 
     # Call analysis endpoint
-    res_analysis = client.get(f"/api/datasets/{data_key}/analysis")
+    res_analysis = client.get(f"/api/v1/datasets/{data_key}/analysis")
     assert res_analysis.status_code == 200
     data = res_analysis.json()
 

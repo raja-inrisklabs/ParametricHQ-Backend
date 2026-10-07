@@ -8,11 +8,27 @@ from app.schemas.dataset import (
     DatasetResponse,
     DatasetDataPreview
 )
+from app.providers.datasets import list_dataset_variables, list_datasets as list_catalog_datasets
 from app.services.dataset_service import dataset_service
 from app.services.storage_service import storage_backend
 from app.services.analysis_service import analysis_service
 
 router = APIRouter(prefix="/datasets", tags=["Datasets"])
+
+
+@router.get("/catalog")
+def list_dataset_catalog(provider_id: Optional[str] = Query(None)):
+    """Datasets the user can select: ERA5-Land and ERA5 single levels."""
+    return list_catalog_datasets(provider_id)
+
+
+@router.get("/catalog/{dataset_id}/variables")
+def list_catalog_variables(dataset_id: str):
+    """Hourly variables the user can select for a dataset."""
+    try:
+        return list_dataset_variables(dataset_id)
+    except KeyError as exc:
+        raise DatasetNotFoundError(dataset_id) from exc
 
 
 @router.post("/request", response_model=DatasetResponse)

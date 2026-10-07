@@ -71,12 +71,12 @@ def test_era5_soil_moisture_layers():
 
 
 def test_providers_api_endpoints(client):
-    res_list = client.get("/api/providers")
+    res_list = client.get("/api/v1/providers")
     assert res_list.status_code == 200
     providers = res_list.json()
     assert any(p["id"] == "era5" for p in providers)
 
-    res_vars = client.get("/api/providers/era5/variables")
+    res_vars = client.get("/api/v1/providers/era5/variables")
     assert res_vars.status_code == 200
     catalog = res_vars.json()
     assert "variables" in catalog
@@ -104,17 +104,17 @@ def test_job_poll_access_lines_are_quiet():
     poll_filter = _QuietJobPollFilter()
     accepted = logging.LogRecord(
         "uvicorn.access", logging.INFO, __file__, 1,
-        '127.0.0.1:1 - "GET /api/datasets/jobs/abc HTTP/1.1" 202',
+        '127.0.0.1:1 - "GET /api/v1/datasets/jobs/abc HTTP/1.1" 202',
         (), None,
     )
     finished = logging.LogRecord(
         "uvicorn.access", logging.INFO, __file__, 1,
-        '127.0.0.1:1 - "GET /api/datasets/jobs/abc HTTP/1.1" 200',
+        '127.0.0.1:1 - "GET /api/v1/datasets/jobs/abc HTTP/1.1" 200',
         (), None,
     )
     request = logging.LogRecord(
         "uvicorn.access", logging.INFO, __file__, 1,
-        '127.0.0.1:1 - "POST /api/datasets/request HTTP/1.1" 202',
+        '127.0.0.1:1 - "POST /api/v1/datasets/request HTTP/1.1" 202',
         (), None,
     )
     assert poll_filter.filter(accepted) is False

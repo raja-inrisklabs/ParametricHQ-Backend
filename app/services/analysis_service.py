@@ -29,9 +29,13 @@ class DatasetAnalysisService:
 
         start_date = df["dt"].min()
         end_date = df["dt"].max()
-        total_calendar_days = (end_date - start_date).days + 1
-        missing_days = max(0, total_calendar_days - len(df))
-        completeness_pct = round((len(df) / total_calendar_days) * 100.0, 2) if total_calendar_days > 0 else 100.0
+        total_calendar_days = (end_date.normalize() - start_date.normalize()).days + 1
+        # Hourly catalog files store one row per variable per hour. Completeness
+        # is measured on unique timestamps, not raw row count.
+        unique_times = df["dt"].nunique()
+        expected_slots = total_calendar_days * 24 if unique_times > total_calendar_days else total_calendar_days
+        missing_days = max(0, expected_slots - unique_times)
+        completeness_pct = round((unique_times / expected_slots) * 100.0, 2) if expected_slots > 0 else 100.0
 
         temporal = {
             "start_date": str(start_date.date()),

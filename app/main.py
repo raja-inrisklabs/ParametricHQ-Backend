@@ -54,11 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount API routers:
-# Under /api (matching frontend proxy rewrite /api/**)
-app.include_router(api_router, prefix="/api")
-
-# Also under /api/v1 for canonical versioned access
+# Versioned API. Callers use /api/v1 only.
 app.include_router(api_router, prefix="/api/v1")
 
 
@@ -68,8 +64,8 @@ def root():
         "service": settings.APP_NAME,
         "version": "1.0.0",
         "docs": "/docs",
-        "health": "/api/health",
-        "providers": "/api/providers",
-        "era5_variables": "/api/providers/era5/variables",
-        "datasets": "/api/datasets"
+        "health": "/api/v1/health",
+        "providers": "/api/v1/providers",
+        "era5_variables": "/api/v1/providers/era5/variables",
+        "datasets": "/api/v1/datasets"
     }

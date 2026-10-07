@@ -10,7 +10,7 @@ class _QuietJobPollFilter(logging.Filter):
         message = record.getMessage()
         if "/datasets/jobs/" not in message:
             return True
-        # uvicorn.access: '... "GET /api/datasets/jobs/{id} HTTP/1.1" 202'
+        # uvicorn.access: '... "GET /api/v1/datasets/jobs/{id} HTTP/1.1" 202'
         return not message.rstrip().endswith(" 202")
 
 

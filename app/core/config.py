@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    API_PREFIX: str = "/api"
+    API_PREFIX: str = "/api/v1"
     BASE_URL: str = "http://localhost:8000"
     CORS_ORIGINS: Union[List[str], str] = ["*"]
 

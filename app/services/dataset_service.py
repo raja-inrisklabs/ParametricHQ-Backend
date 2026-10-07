@@ -2,10 +2,13 @@ import re
 import threading
 import uuid
 from typing import Optional, Dict, Any, Tuple, List
+import pandas as pd
 
+from app.core.config import settings
 from app.core.logging import logger
 from app.core.exceptions import DatasetNotFoundError, ProviderError
 from app.schemas.dataset import DatasetRequest, DatasetResponse
+from app.providers.datasets import get_dataset
 from app.providers.registry import registry
 from app.services.job_store import job_store
 from app.services.storage_service import storage_backend
@@ -26,6 +29,23 @@ class DatasetService:
         """
         loc_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", req.location.strip().lower())
         provider_clean = req.provider_id.strip().lower()
+        if req.dataset_id:
+            dataset_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", req.dataset_id.strip().lower())
+            if req.is_point():
+                place_clean = "lat{0}_lon{1}".format(
+                    *[("%g" % value).replace("-", "m").replace(".", "p") for value in req.snapped_point()]
+                )
+            else:
+                area = req.cds_area()
+                place_clean = "n{0}_w{1}_s{2}_e{3}".format(
+                    *[("%g" % value).replace("-", "m").replace(".", "p") for value in area]
+                )
+            selected = sorted(name.strip().lower() for name in req.parameters or [])
+            variable_clean = "all" if not selected else "vars_" + "_".join(selected)
+            end = req.end_date if req.end_date != req.start_date else req.start_date
+            span = req.start_date if end == req.start_date else f"{req.start_date}_{end}"
+            return f"{provider_clean}_{dataset_clean}_{place_clean}_{variable_clean}_{span}_hourly"
+
         res_clean = (req.resolution or "0.1deg").replace(".", "_")
         time_clean = (req.temporal_resolution or "hourly").strip().lower()
         ver_clean = (req.version or "v1").lower()
@@ -67,6 +87,11 @@ class DatasetService:
         if storage_backend.dataset_exists(data_key):
             return self._ready_from_cache(data_key, requested_vars), 200
 
+        if req.is_point():
+            extracted = self._extract_point_from_stored_grid(req, data_key, self._catalog_variables(req))
+            if extracted:
+                return extracted, 200
+
         active = job_store.get_active_for_key(data_key)
         if active:
             return DatasetResponse(
@@ -90,6 +115,95 @@ class DatasetService:
             data_key=data_key,
             detail="Request accepted. Fetch will start shortly.",
         ), 202
+
+    def _catalog_variables(self, req: DatasetRequest) -> List[str]:
+        if not req.dataset_id:
+            return req.requested_parameters
+        catalog = get_dataset(req.dataset_id)
+        available = list(catalog.get("hourly_variables") or catalog["variables"])
+        selected = [name for name in (req.parameters or []) if name in available]
+        return selected or available
+
+    @staticmethod
+    def _covers_point(entry: Dict[str, Any], lat: float, lon: float, step: float) -> bool:
+        area = entry.get("area") or []
+        if len(area) != 4:
+            return False
+        north, west, south, east = [float(value) for value in area]
+        # A single stored cell is not a source box for another point.
+        if (north - south) <= step + 0.01 and (east - west) <= step + 0.01:
+            return False
+        return south <= lat <= north and west <= lon <= east
+
+    @staticmethod
+    def _covers_dates(entry: Dict[str, Any], start_date: str, end_date: str) -> bool:
+        stored_start = entry.get("start_date")
+        stored_end = entry.get("end_date") or stored_start
+        return bool(stored_start and stored_end and stored_start <= start_date and end_date <= stored_end)
+
+    def _extract_point_from_stored_grid(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        requested_vars: List[str],
+    ) -> Optional[DatasetResponse]:
+        """Reuse a stored box by coverage. The point keeps its own file name."""
+        lat, lon = req.snapped_point()
+        needed = set(requested_vars)
+        matches = []
+        for entry in storage_backend._read_catalog().values():
+            if entry.get("dataset_id") != req.dataset_id:
+                continue
+            if not self._covers_dates(entry, req.start_date, req.end_date):
+                continue
+            stored = set(entry.get("parameters") or [])
+            if needed and not needed <= stored:
+                continue
+            if not self._covers_point(entry, lat, lon, req.grid_step()):
+                continue
+            matches.append(entry)
+        if not matches:
+            logger.info(f"No stored grid covers {lat}, {lon} for {req.start_date} to {req.end_date}")
+            return None
+
+        # Prefer the smallest box that already has the cell, so a tight fetch is reused first.
+        matches.sort(key=lambda entry: (entry["area"][0] - entry["area"][2]) * (entry["area"][3] - entry["area"][1]))
+        source = matches[0]
+        source_key = source.get("data_key")
+        try:
+            frame = storage_backend.read_dataset(source_key)
+        except Exception as exc:
+            logger.warning(f"Could not read stored grid {source_key}: {exc}")
+            return None
+
+        stamps = pd.to_datetime(frame["timestamp"])
+        start = pd.Timestamp(req.start_date)
+        end = pd.Timestamp(req.end_date) + pd.Timedelta(days=1)
+        frame = frame[(stamps >= start) & (stamps < end)]
+        nearest = frame.assign(
+            _distance=(frame["latitude"] - lat).abs() + (frame["longitude"] - lon).abs()
+        )
+        if nearest.empty:
+            return None
+        best = nearest["_distance"].min()
+        # The stored cell must be the requested dataset's own grid cell.
+        if best > req.grid_step() / 2 + 0.001:
+            logger.info(f"Stored grid {source_key} has no {req.grid_step()} degree cell at {lat}, {lon}")
+            return None
+        cell = nearest[nearest["_distance"] == best].drop(columns="_distance")
+        if needed and "variable" in cell.columns:
+            cell = cell[cell["variable"].isin(needed)]
+        if cell.empty:
+            return None
+
+        cell = cell.copy()
+        cell["latitude"] = lat
+        cell["longitude"] = lon
+        self._store_frame(req, data_key, cell.reset_index(drop=True), requested_vars, lat, lon, source_key)
+        response = self._ready_from_cache(data_key, requested_vars)
+        response.detail = f"Taken from stored grid {source_key} at {lat}, {lon}."
+        logger.info(response.detail)
+        return response
 
     def get_job(self, job_id: str) -> Tuple[DatasetResponse, int]:
         job = job_store.get(job_id)
@@ -168,7 +282,13 @@ class DatasetService:
         return self._fetch_and_store(req, data_key), 200
 
     def _fetch_and_store(self, req: DatasetRequest, data_key: str) -> DatasetResponse:
-        requested_vars = req.requested_parameters
+        if req.dataset_id:
+            catalog = get_dataset(req.dataset_id)
+            available = set(catalog.get("hourly_variables") or catalog["variables"])
+            unknown = [name for name in (req.parameters or []) if name not in available]
+            if unknown:
+                raise ValueError(f"Unknown variables for {req.dataset_id}: {', '.join(unknown)}")
+        requested_vars = self._catalog_variables(req)
 
         # Resolve location coordinates
         lat, lon = GeocodingService.resolve_coordinates(
@@ -176,6 +296,11 @@ class DatasetService:
             lat_override=req.latitude,
             lon_override=req.longitude
         )
+        if req.is_point() and req.dataset_id:
+            reused = self._extract_point_from_stored_grid(req, data_key, requested_vars)
+            if reused:
+                return reused
+            lat, lon = req.snapped_point()
 
         provider = registry.get(req.provider_id)
         try:
@@ -185,87 +310,79 @@ class DatasetService:
         except Exception as exc:
             raise ProviderError(req.provider_id, str(exc)) from exc
 
-        # Build summary statistics
+        stored = self._store_frame(req, data_key, df, requested_vars, lat, lon)
+        stored.cached = False
+        stored.detail = "Fetched from provider and stored in central repository."
+        return stored
+
+    def _store_frame(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        df: pd.DataFrame,
+        requested_vars: List[str],
+        lat: float,
+        lon: float,
+        source_key: Optional[str] = None,
+    ) -> DatasetResponse:
+        provider = registry.get(req.provider_id)
         summary = {
             "total_records": len(df),
             "start": str(df["timestamp"].min()) if not df.empty else None,
             "end": str(df["timestamp"].max()) if not df.empty else None,
+            "source_grid": source_key,
         }
-
-        # If single variable with 'value' column
-        if "value" in df.columns:
+        if "value" in df.columns and not df.empty:
             summary.update({
-                "mean": round(float(df["value"].mean()), 3) if not df.empty else 0.0,
-                "min": round(float(df["value"].min()), 3) if not df.empty else 0.0,
-                "max": round(float(df["value"].max()), 3) if not df.empty else 0.0,
-                "sum": round(float(df["value"].sum()), 3) if not df.empty else 0.0,
-                "unit": str(df["unit"].iloc[0]) if not df.empty and "unit" in df.columns else "",
+                "mean": round(float(df["value"].mean()), 3),
+                "min": round(float(df["value"].min()), 3),
+                "max": round(float(df["value"].max()), 3),
+                "sum": round(float(df["value"].sum()), 3),
+                "unit": str(df["unit"].iloc[0]) if "unit" in df.columns else "",
             })
-
-        # Summary for all variable columns in df
-        var_summaries = {}
-        for col in df.columns:
-            if col not in ["timestamp", "latitude", "longitude", "value", "unit", "parameter"]:
-                s = df[col].dropna()
-                var_summaries[col] = {
-                    "mean": round(float(s.mean()), 3) if not s.empty else 0.0,
-                    "min": round(float(s.min()), 3) if not s.empty else 0.0,
-                    "max": round(float(s.max()), 3) if not s.empty else 0.0,
-                    "sum": round(float(s.sum()), 3) if not s.empty else 0.0,
-                }
-        summary["variable_stats"] = var_summaries
-
-        primary_param = requested_vars[0] if len(requested_vars) == 1 else "multi_parameter"
         metadata = {
             "location": req.location,
             "latitude": lat,
             "longitude": lon,
+            "area": (
+                [round(lat + req.grid_step() / 2, 2), round(lon - req.grid_step() / 2, 2), round(lat - req.grid_step() / 2, 2), round(lon + req.grid_step() / 2, 2)]
+                if req.is_point()
+                else (list(req.cds_area()) if req.dataset_id else None)
+            ),
+            "grid_points": int(df.groupby(["latitude", "longitude"]).ngroups) if {"latitude", "longitude"} <= set(df.columns) else 1,
             "start_date": req.start_date,
             "end_date": req.end_date,
-            "resolution": req.resolution or provider.default_resolution,
+            "dataset_id": req.dataset_id,
+            "resolution": f"{req.grid_step()}deg" if req.dataset_id else (req.resolution or "0.1deg"),
+            "temporal_resolution": "hourly",
             "version": req.version or "v1",
             "parameters": requested_vars,
             "summary": summary,
             "provider_name": provider.name,
-            "provider_is_configured": provider.is_configured,
+            "source_grid": source_key,
         }
-
-        # 3. Store in scalable Parquet format
-        storage_path, file_size, checksum = storage_backend.save_dataset(
+        storage_backend.save_dataset(
             provider_id=req.provider_id,
-            parameter_type=primary_param,
+            parameter_type=req.dataset_id or requested_vars[0],
             data_key=data_key,
             df=df,
-            metadata=metadata
+            metadata=metadata,
         )
-
-        download_url = storage_backend.build_download_url(data_key)
-
-        return DatasetResponse(
-            status="ready",
-            cached=False,
-            download_url=download_url,
-            data_key=data_key,
-            record_count=len(df),
-            file_size_bytes=file_size,
-            parameters=requested_vars,
-            summary_stats=summary,
-            detail="Fetched from provider and stored in central repository."
-        )
+        return self._ready_from_cache(data_key, requested_vars)
 
     def get_dataset_metadata(self, data_key: str) -> Dict[str, Any]:
         meta = storage_backend.get_metadata(data_key)
         if not meta:
             raise DatasetNotFoundError(data_key)
         meta["download_url"] = storage_backend.build_download_url(data_key)
-        meta["analysis_url"] = f"/api/datasets/{data_key}/analysis"
+        meta["analysis_url"] = f"{settings.API_PREFIX}/datasets/{data_key}/analysis"
         return meta
 
     def list_datasets(self, provider_id: Optional[str] = None, parameter_type: Optional[str] = None) -> List[Dict[str, Any]]:
         datasets = storage_backend.list_datasets(provider_id=provider_id, parameter_type=parameter_type)
         for d in datasets:
             d["download_url"] = storage_backend.build_download_url(d["data_key"])
-            d["analysis_url"] = f"/api/datasets/{d['data_key']}/analysis"
+            d["analysis_url"] = f"{settings.API_PREFIX}/datasets/{d['data_key']}/analysis"
         return datasets
 
 
