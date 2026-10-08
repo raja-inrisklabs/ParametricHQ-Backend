@@ -177,6 +177,14 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         return str(parquet_path), file_size, checksum
 
     def read_dataset(self, data_key: str) -> pd.DataFrame:
+        meta = self.get_metadata(data_key) or {}
+        parts = meta.get("assembled_from") or []
+        if parts:
+            frames = [self._read_parquet(part) for part in parts]
+            return pd.concat(frames, ignore_index=True)
+        return self._read_parquet(data_key)
+
+    def _read_parquet(self, data_key: str) -> pd.DataFrame:
         p_path, _ = self._resolve_paths(data_key)
         if not p_path or not p_path.exists():
             raise PlatformException(f"Dataset '{data_key}' does not exist in storage.", status_code=404)
@@ -199,7 +207,7 @@ class LocalScalableStorageBackend(BaseStorageBackend):
 
     def list_datasets(self, provider_id: Optional[str] = None, parameter_type: Optional[str] = None) -> List[Dict[str, Any]]:
         catalog = self._read_catalog()
-        results = list(catalog.values())
+        results = [item for item in catalog.values() if isinstance(item, dict) and item.get("data_key")]
 
         if provider_id:
             results = [r for r in results if r.get("provider_id", "").lower() == provider_id.lower()]
@@ -215,6 +223,15 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         if not p_path or not p_path.exists():
             raise PlatformException(f"Dataset '{data_key}' file not found for download.", status_code=404)
         return p_path
+
+    def read_dataset_view(self, data_key: str) -> pd.DataFrame:
+        """Read one file, or assemble a request view from the files named in catalog.json."""
+        meta = self.get_metadata(data_key) or {}
+        parts = meta.get("assembled_from") or []
+        if not parts:
+            return self.read_dataset(data_key)
+        frames = [self.read_dataset(part) for part in parts]
+        return pd.concat(frames, ignore_index=True)
 
     def build_download_url(self, data_key: str) -> str:
         return f"{settings.API_PREFIX}/datasets/{data_key}/download"

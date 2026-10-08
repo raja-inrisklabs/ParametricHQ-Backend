@@ -26,9 +26,19 @@ class JobStore:
             return {}
 
     def _write(self, jobs: Dict[str, Any]) -> None:
+        import time
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(jobs, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        payload = json.dumps(jobs, indent=2)
+        tmp.write_text(payload, encoding="utf-8")
+        for attempt in range(5):
+            try:
+                tmp.replace(self.path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    self.path.write_text(payload, encoding="utf-8")
+                    return
+                time.sleep(0.05)
 
     def get(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:

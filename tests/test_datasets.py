@@ -199,6 +199,67 @@ def test_point_inside_a_stored_box_is_taken_from_that_grid(client):
     assert row["longitude"] == 72.0
 
 
+def test_missing_variable_is_fetched_into_its_own_file(client):
+    box = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "sample-area",
+        "start_date": "2024-02-01",
+        "end_date": "2024-02-01",
+        "parameters": ["2m_temperature"],
+        "north": 24,
+        "west": 70,
+        "south": 22,
+        "east": 74,
+    }
+    stored = _wait_for_job(client, box)
+    assert stored.status_code == 200
+    box_key = stored.json()["data_key"]
+    box_rows = client.get(f"/api/v1/datasets/{box_key}/data?limit=1000").json()["total_records"]
+
+    point = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23.04,72.48",
+        "start_date": "2024-02-01",
+        "end_date": "2024-02-01",
+        "parameters": ["2m_temperature", "total_precipitation"],
+        "latitude": 23.04,
+        "longitude": 72.48,
+    }
+    ready = _wait_for_job(client, point)
+    assert ready.status_code == 200
+    body = ready.json()
+    assert "lat23_lon72p5" in body["data_key"]
+    assert "Fetched total_precipitation" in body["detail"]
+    assert "Reused 2m_temperature" in body["detail"]
+    assert body["record_count"] == 48
+
+    from app.services.storage_service import storage_backend
+    stored_rows = storage_backend.read_dataset(body["data_key"])
+    assert set(stored_rows["variable"]) == {"2m_temperature", "total_precipitation"}
+    assert set(stored_rows["latitude"]) == {23.0}
+    assert set(stored_rows["longitude"]) == {72.5}
+    assert (stored_rows["variable"] == "2m_temperature").sum() == 24
+    assert (stored_rows["variable"] == "total_precipitation").sum() == 24
+
+    # The original box file is unchanged. The new variable lives in its own point file.
+    assert client.get(f"/api/v1/datasets/{box_key}/data?limit=1").json()["total_records"] == box_rows
+    meta = client.get(f"/api/v1/datasets/{body['data_key']}").json()
+    assert meta["variable_sources"]["2m_temperature"] == box_key
+    fetched_key = meta["variable_sources"]["total_precipitation"]
+    assert fetched_key != box_key
+    fetched_meta = client.get(f"/api/v1/datasets/{fetched_key}").json()
+    assert fetched_meta["parameters"] == ["total_precipitation"]
+
+    # A later request for one more variable fetches only that variable.
+    wind = {**point, "parameters": ["2m_temperature", "total_precipitation", "10m_u_component_of_wind"]}
+    again = _wait_for_job(client, wind)
+    assert again.status_code == 200
+    assert "Fetched 10m_u_component_of_wind" in again.json()["detail"]
+    assert "total_precipitation" not in again.json()["detail"].split("Fetched", 1)[1]
+
+
 def test_point_outside_a_stored_box_is_not_taken_from_it(client):
     box = {
         "provider_id": "era5",

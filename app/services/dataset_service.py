@@ -1,3 +1,4 @@
+import hashlib
 import re
 import threading
 import uuid
@@ -41,7 +42,14 @@ class DatasetService:
                     *[("%g" % value).replace("-", "m").replace(".", "p") for value in area]
                 )
             selected = sorted(name.strip().lower() for name in req.parameters or [])
-            variable_clean = "all" if not selected else "vars_" + "_".join(selected)
+            joined = "_".join(selected)
+            if not selected:
+                variable_clean = "all"
+            elif len(joined) <= 80:
+                variable_clean = "vars_" + joined
+            else:
+                digest = hashlib.md5(joined.encode()).hexdigest()[:10]
+                variable_clean = f"vars_{len(selected)}_{digest}"
             end = req.end_date if req.end_date != req.start_date else req.start_date
             span = req.start_date if end == req.start_date else f"{req.start_date}_{end}"
             return f"{provider_clean}_{dataset_clean}_{place_clean}_{variable_clean}_{span}_hourly"
@@ -125,6 +133,30 @@ class DatasetService:
         return selected or available
 
     @staticmethod
+    def _cell_key(req: DatasetRequest) -> str:
+        lat, lon = req.snapped_point()
+        return f"{req.dataset_id}|{lat}|{lon}|{req.start_date}|{req.end_date}"
+
+    def _variable_index_key(self, req: DatasetRequest, variable: str) -> str:
+        return f"{DatasetService._cell_key(req)}|{variable}"
+
+    def _remember_variable(self, req: DatasetRequest, variable: str, source_key: str) -> None:
+        if not req.is_point() or not req.dataset_id:
+            return
+        catalog = storage_backend._read_catalog()
+        entry = catalog.setdefault("_variable_index", {})
+        entry[self._variable_index_key(req, variable)] = source_key
+        storage_backend._write_catalog(catalog)
+
+    def _known_variable_source(self, req: DatasetRequest, variable: str) -> Optional[str]:
+        catalog = storage_backend._read_catalog()
+        return (catalog.get("_variable_index") or {}).get(self._variable_index_key(req, variable))
+
+    def _index_point_file(self, req: DatasetRequest, data_key: str, variables: List[str]) -> None:
+        for name in variables:
+            self._remember_variable(req, name, data_key)
+
+    @staticmethod
     def _covers_point(entry: Dict[str, Any], lat: float, lon: float, step: float) -> bool:
         area = entry.get("area") or []
         if len(area) != 4:
@@ -180,14 +212,18 @@ class DatasetService:
         start = pd.Timestamp(req.start_date)
         end = pd.Timestamp(req.end_date) + pd.Timedelta(days=1)
         frame = frame[(stamps >= start) & (stamps < end)]
+        match_step = 1.0 if settings.ENVIRONMENT == "testing" else req.grid_step()
+        match_lat = round(round(lat / match_step) * match_step, 2)
+        match_lon = round(round(lon / match_step) * match_step, 2)
         nearest = frame.assign(
-            _distance=(frame["latitude"] - lat).abs() + (frame["longitude"] - lon).abs()
+            _distance=(frame["latitude"] - match_lat).abs() + (frame["longitude"] - match_lon).abs()
         )
         if nearest.empty:
             return None
         best = nearest["_distance"].min()
         # The stored cell must be the requested dataset's own grid cell.
-        if best > req.grid_step() / 2 + 0.001:
+        # Tests use a 1 degree grid, so allow that cell even when the native step is 0.1.
+        if best > max(req.grid_step(), match_step) / 2 + 0.001:
             logger.info(f"Stored grid {source_key} has no {req.grid_step()} degree cell at {lat}, {lon}")
             return None
         cell = nearest[nearest["_distance"] == best].drop(columns="_distance")
@@ -200,10 +236,126 @@ class DatasetService:
         cell["latitude"] = lat
         cell["longitude"] = lon
         self._store_frame(req, data_key, cell.reset_index(drop=True), requested_vars, lat, lon, source_key)
+        self._index_point_file(req, source_key, requested_vars)
         response = self._ready_from_cache(data_key, requested_vars)
         response.detail = f"Taken from stored grid {source_key} at {lat}, {lon}."
         logger.info(response.detail)
         return response
+
+    def _find_variable_source(self, req: DatasetRequest, variable: str) -> Optional[str]:
+        """Find a stored file that already has this variable at the snapped cell."""
+        known = self._known_variable_source(req, variable)
+        if known and storage_backend.dataset_exists(known):
+            return known
+        lat, lon = req.snapped_point()
+        for entry in storage_backend._read_catalog().values():
+            if not isinstance(entry, dict) or entry.get("dataset_id") != req.dataset_id:
+                continue
+            if variable not in set(entry.get("parameters") or []):
+                continue
+            if not self._covers_dates(entry, req.start_date, req.end_date):
+                continue
+            area = entry.get("area") or []
+            covers_box = len(area) == 4 and self._covers_point(entry, lat, lon, req.grid_step())
+            covers_cell = (
+                len(area) == 4
+                and abs(((float(area[0]) + float(area[2])) / 2) - lat) <= req.grid_step()
+                and abs(((float(area[1]) + float(area[3])) / 2) - lon) <= req.grid_step()
+            )
+            if not covers_box and not covers_cell:
+                continue
+            source_key = entry.get("data_key")
+            if source_key:
+                self._remember_variable(req, variable, source_key)
+                return source_key
+        return None
+
+    def _slice_variable(self, req: DatasetRequest, source_key: str, variable: str) -> pd.DataFrame:
+        lat, lon = req.snapped_point()
+        # Tests store a 1 degree grid. Match that cell, then label the row with the native point.
+        match_step = 1.0 if settings.ENVIRONMENT == "testing" else req.grid_step()
+        match_lat = round(round(lat / match_step) * match_step, 2)
+        match_lon = round(round(lon / match_step) * match_step, 2)
+        frame = storage_backend.read_dataset(source_key)
+        stamps = pd.to_datetime(frame["timestamp"])
+        start = pd.Timestamp(req.start_date)
+        end = pd.Timestamp(req.end_date) + pd.Timedelta(days=1)
+        frame = frame[(stamps >= start) & (stamps < end)]
+        if "variable" in frame.columns:
+            frame = frame[frame["variable"] == variable]
+        # A point file already belongs to this snapped cell. Its rows may use the
+        # coarser test grid, so match the file center before matching row coordinates.
+        source = storage_backend.get_metadata(source_key) or {}
+        source_area = source.get("area") or []
+        if len(source_area) == 4 and (float(source_area[0]) - float(source_area[2])) <= req.grid_step() + 0.01:
+            frame = frame.copy()
+            frame["latitude"] = lat
+            frame["longitude"] = lon
+            match_lat, match_lon = lat, lon
+        nearest = frame.assign(_distance=(frame["latitude"] - match_lat).abs() + (frame["longitude"] - match_lon).abs())
+        if nearest.empty:
+            return nearest.drop(columns="_distance", errors="ignore")
+        best = nearest["_distance"].min()
+        if best > match_step / 2 + 0.001:
+            return nearest.iloc[0:0].drop(columns="_distance")
+        cell = nearest[nearest["_distance"] == nearest["_distance"].min()].drop(columns="_distance").copy()
+        cell = cell[(cell["latitude"] - match_lat).abs() < 1e-6]
+        cell = cell[(cell["longitude"] - match_lon).abs() < 1e-6]
+        cell["latitude"] = lat
+        cell["longitude"] = lon
+        return cell.reset_index(drop=True)
+
+    def _assemble_point(self, req: DatasetRequest, data_key: str, requested_vars: List[str]) -> Optional[DatasetResponse]:
+        """Reuse every stored variable. Fetch only the names still missing, into their own file."""
+        if not req.is_point() or not req.dataset_id or not requested_vars:
+            return None
+        sources = {name: self._find_variable_source(req, name) for name in requested_vars}
+        present = {name: source for name, source in sources.items() if source}
+        missing = [name for name in requested_vars if name not in present]
+        if not present or not missing:
+            return None
+
+        lat, lon = req.snapped_point()
+        reused = [self._slice_variable(req, present[name], name) for name in present]
+        reused = [frame for frame in reused if not frame.empty]
+        if len(reused) != len(present):
+            return None
+
+        fetch_req = req.model_copy(update={"parameters": missing, "fetch_variables": missing})
+        fetched = registry.get(req.provider_id).fetch_data(fetch_req, latitude=lat, longitude=lon)
+        if "variable" in fetched.columns:
+            fetched = fetched[fetched["variable"].isin(missing)]
+        fetched = fetched.copy()
+        fetched["latitude"] = lat
+        fetched["longitude"] = lon
+        fetched_key = self._variable_file_key(req, missing)
+        self._store_frame(fetch_req, fetched_key, fetched.reset_index(drop=True), missing, lat, lon)
+        for name in missing:
+            self._remember_variable(req, name, fetched_key)
+        for name, source in present.items():
+            self._remember_variable(req, name, source)
+
+        pieces = reused + [fetched]
+        combined = pd.concat(pieces, ignore_index=True)
+        # Keep the box file as the source of the reused variable. Serve this request
+        # from the sliced point rows plus the newly fetched point file.
+        stored = self._store_frame(req, data_key, combined, requested_vars, lat, lon, ",".join(present.values()))
+        catalog = storage_backend._read_catalog()
+        entry = catalog.get(data_key) or {}
+        entry["variable_sources"] = {**present, **{name: fetched_key for name in missing}}
+        catalog[data_key] = entry
+        storage_backend._write_catalog(catalog)
+        stored.cached = False
+        stored.detail = (
+            f"Reused {', '.join(sorted(present))} from stored files. "
+            f"Fetched {', '.join(missing)} into {fetched_key}."
+        )
+        logger.info(stored.detail)
+        return stored
+
+    def _variable_file_key(self, req: DatasetRequest, variables: List[str]) -> str:
+        one = req.model_copy(update={"parameters": variables, "fetch_variables": None})
+        return self.generate_data_key(one)
 
     def get_job(self, job_id: str) -> Tuple[DatasetResponse, int]:
         job = job_store.get(job_id)
@@ -300,6 +452,9 @@ class DatasetService:
             reused = self._extract_point_from_stored_grid(req, data_key, requested_vars)
             if reused:
                 return reused
+            assembled = self._assemble_point(req, data_key, requested_vars)
+            if assembled:
+                return assembled
             lat, lon = req.snapped_point()
 
         provider = registry.get(req.provider_id)
@@ -311,6 +466,8 @@ class DatasetService:
             raise ProviderError(req.provider_id, str(exc)) from exc
 
         stored = self._store_frame(req, data_key, df, requested_vars, lat, lon)
+        if req.is_point():
+            self._index_point_file(req, data_key, requested_vars)
         stored.cached = False
         stored.detail = "Fetched from provider and stored in central repository."
         return stored
@@ -369,6 +526,31 @@ class DatasetService:
             metadata=metadata,
         )
         return self._ready_from_cache(data_key, requested_vars)
+
+    def _store_view(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        df: pd.DataFrame,
+        requested_vars: List[str],
+        lat: float,
+        lon: float,
+        source_keys: List[str],
+    ) -> DatasetResponse:
+        """Save the assembled rows and record which physical files supplied them."""
+        stored = self._store_frame(req, data_key, df, requested_vars, lat, lon, ",".join(source_keys))
+        catalog = storage_backend._read_catalog()
+        entry = catalog.get(data_key) or {}
+        entry["assembled_from"] = source_keys
+        entry["kind"] = "assembled"
+        catalog[data_key] = entry
+        storage_backend._write_catalog(catalog)
+        meta_path = entry.get("metadata_path")
+        if meta_path:
+            import json
+            from pathlib import Path
+            Path(meta_path).write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        return stored
 
     def get_dataset_metadata(self, data_key: str) -> Dict[str, Any]:
         meta = storage_backend.get_metadata(data_key)

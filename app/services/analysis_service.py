@@ -17,7 +17,7 @@ class DatasetAnalysisService:
         if not storage_backend.dataset_exists(data_key):
             raise PlatformException(f"Dataset '{data_key}' was not found in storage.", status_code=404)
 
-        df = storage_backend.read_dataset(data_key)
+        df = storage_backend.read_dataset_view(data_key)
         if df.empty:
             raise PlatformException(f"Dataset '{data_key}' is empty.", status_code=400)
 

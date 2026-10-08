@@ -100,7 +100,7 @@ def preview_dataset_data(
     """
     Preview time-series rows and summary statistics from the stored Parquet file.
     """
-    df = storage_backend.read_dataset(data_key)
+    df = storage_backend.read_dataset_view(data_key)
     meta = storage_backend.get_metadata(data_key) or {}
 
     var_cols = [

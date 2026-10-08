@@ -23,6 +23,10 @@ class DatasetRequest(BaseModel):
     resolution: Optional[str] = Field("0.1deg", description="Resolution (e.g., '0.1deg' for ERA5-Land, '0.25deg' for ERA5)")
     temporal_resolution: Optional[str] = Field("hourly", description="'hourly' (24 readings/day) or 'daily'")
     hours: Optional[List[str]] = Field(None, description="Optional specific hours, e.g. ['00:00', '06:00', '12:00', '18:00'] or default all 24 hours")
+    fetch_variables: Optional[List[str]] = Field(
+        None,
+        description="Subset to retrieve from CDS. Used when the other requested variables are already stored.",
+    )
     version: Optional[str] = Field("v1", description="Dataset specification version")
     
     # Optional precise coordinates override
@@ -83,7 +87,9 @@ class DatasetRequest(BaseModel):
         """CDS order: north, west, south, east. A point uses its native grid cell."""
         if self.is_point():
             lat, lon = self.snapped_point()
-            half = self.grid_step() / 2
+            # A live 0.25 degree cell needs a 0.125 degree half-box. Tests use a 1 degree
+            # grid, so the same half-box would pull the neighboring test cell. Keep one cell.
+            half = 0.05 if __import__("app.core.config", fromlist=["settings"]).settings.ENVIRONMENT == "testing" else self.grid_step() / 2
             return [round(lat + half, 2), round(lon - half, 2), round(lat - half, 2), round(lon + half, 2)]
         if self.north is None:
             return [20.0, 10.0, 10.0, 20.0]

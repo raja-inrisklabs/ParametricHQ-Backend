@@ -586,6 +586,8 @@ class ERA5Provider(BaseProvider):
         available = list(catalog.get("hourly_variables") or catalog["variables"])
         selected = [name for name in (request.parameters or []) if name in available]
         variables = selected or available
+        if request.fetch_variables:
+            variables = [name for name in variables if name in request.fetch_variables]
         units = catalog["units"]
 
         if self.is_configured:
@@ -873,8 +875,8 @@ class ERA5Provider(BaseProvider):
         # Tests use a coarse step so a box does not write millions of random rows.
         if settings.ENVIRONMENT == "testing":
             step = 1.0
-        latitudes = np.round(np.arange(south, north + step / 10, step), 1)
-        longitudes = np.round(np.arange(west, east + step / 10, step), 1)
+        latitudes = np.round(np.round(np.arange(south, north + step / 10, step) / step) * step, 2)
+        longitudes = np.round(np.round(np.arange(west, east + step / 10, step) / step) * step, 2)
         stop = end or day
         hours = pd.date_range(start=day, end=stop + datetime.timedelta(hours=23), freq="h")
         grid = pd.MultiIndex.from_product(
