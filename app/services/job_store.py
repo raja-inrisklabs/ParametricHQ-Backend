@@ -1,10 +1,9 @@
 """File-backed fetch jobs so a long CDS download does not hold the HTTP request."""
-import json
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.core.config import settings
+from app.services.object_store import object_store
 
 
 def _now() -> str:
@@ -14,31 +13,13 @@ def _now() -> str:
 class JobStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.path = settings.storage_path / "jobs.json"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.path.write_text("{}", encoding="utf-8")
+        self.name = "jobs.json"
 
     def _read(self) -> Dict[str, Any]:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return object_store.read_json(self.name)
 
     def _write(self, jobs: Dict[str, Any]) -> None:
-        import time
-        tmp = self.path.with_suffix(".json.tmp")
-        payload = json.dumps(jobs, indent=2)
-        tmp.write_text(payload, encoding="utf-8")
-        for attempt in range(5):
-            try:
-                tmp.replace(self.path)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    self.path.write_text(payload, encoding="utf-8")
-                    return
-                time.sleep(0.05)
+        object_store.write_json(self.name, jobs)
 
     def get(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:

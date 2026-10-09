@@ -20,10 +20,11 @@ class Settings(BaseSettings):
     BASE_URL: str = "http://localhost:8000"
     CORS_ORIGINS: Union[List[str], str] = ["*"]
 
-    # Storage: Scalable GCS-ready filesystem layout
-    STORAGE_BACKEND: str = "local"  # 'local' or 'gcs'
+    # Storage: local files for tests, Google Cloud Storage for the running API.
+    STORAGE_BACKEND: str = "gcs"  # 'local' or 'gcs'
     STORAGE_DIR: str = "./storage"
-    GCS_BUCKET_NAME: Optional[str] = ""
+    GCS_BUCKET_NAME: str = "prametric_hq"
+    GOOGLE_CLOUD_PROJECT: str = "testing-41686"
 
     # ERA5 (ECMWF Copernicus Climate Data Store)
     CDSAPI_URL: str = "https://cds.climate.copernicus.eu/api"

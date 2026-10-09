@@ -16,9 +16,11 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info(f"Starting {settings.APP_NAME} in '{settings.ENVIRONMENT}' mode...")
     
-    # Verify storage layout readiness
-    storage_backend.providers_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Scalable storage initialized at: {settings.storage_path.resolve()} (GCS-ready layout)")
+    if settings.STORAGE_BACKEND == "gcs":
+        logger.info(f"Storage uses gs://{settings.GCS_BUCKET_NAME}/provider/{{dataset}}/{{year}}/{{month}}")
+    else:
+        storage_backend.providers_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Storage uses local files at {settings.storage_path.resolve()}")
 
     # Log available providers
     for p in registry.list_all():

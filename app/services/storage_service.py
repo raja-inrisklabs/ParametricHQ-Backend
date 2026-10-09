@@ -1,6 +1,7 @@
-import os
-import json
 import hashlib
+import io
+import json
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -9,6 +10,7 @@ import pandas as pd
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.exceptions import PlatformException
+from app.services.object_store import object_store
 
 
 class BaseStorageBackend(ABC):
@@ -60,65 +62,48 @@ class BaseStorageBackend(ABC):
 
 class LocalScalableStorageBackend(BaseStorageBackend):
     """
-    Local filesystem storage formatted to scale directly into Google Cloud Storage (GCS).
+    Dataset storage. The running API writes to the GCS bucket. Tests write to local files.
     Layout:
-        storage/
-        ├── catalog.json                                # Central manifest
-        └── providers/
-            └── {provider_id}/
-                └── {parameter_type}/
-                    └── {year}/
-                        ├── {data_key}.parquet          # Apache Parquet data
-                        └── {data_key}.meta.json        # Dataset metadata & schema
-    This exact key layout maps 1:1 to GCS blob paths:
-        gs://{bucket}/providers/{provider_id}/{parameter_type}/{year}/{data_key}.parquet
+        catalog.json
+        jobs.json
+        provider/{dataset}/{year}/{month}/{data_key}.parquet
+        provider/{dataset}/{year}/{month}/{data_key}.meta.json
     """
 
     def __init__(self, root_dir: Path = None):
         self.root_dir = root_dir or settings.storage_path
-        self.providers_dir = self.root_dir / "providers"
-        self.providers_dir.mkdir(parents=True, exist_ok=True)
-        self.catalog_file = self.root_dir / "catalog.json"
-        self._init_catalog()
+        self.providers_dir = self.root_dir / "provider"
+        self.catalog_name = "catalog.json"
+        if settings.STORAGE_BACKEND != "gcs":
+            self.providers_dir.mkdir(parents=True, exist_ok=True)
+            self.catalog_file = self.root_dir / self.catalog_name
 
     def _init_catalog(self):
-        if not self.catalog_file.exists():
+        if not object_store.exists(self.catalog_name):
             self._write_catalog({})
 
     def _read_catalog(self) -> Dict[str, Any]:
-        if not self.catalog_file.exists():
-            return {}
         try:
-            with open(self.catalog_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return object_store.read_json(self.catalog_name)
         except Exception as e:
             logger.warning(f"Error reading catalog.json, reinitializing: {e}")
             return {}
 
     def _write_catalog(self, catalog: Dict[str, Any]):
-        with open(self.catalog_file, "w", encoding="utf-8") as f:
-            json.dump(catalog, f, indent=2)
+        object_store.write_json(self.catalog_name, catalog)
 
-    def _build_storage_dir(self, provider_id: str, parameter_type: str, year: str) -> Path:
-        target_dir = self.providers_dir / provider_id.lower() / parameter_type.lower() / str(year)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return target_dir
+    def _object_name(self, provider_id: str, parameter_type: str, year: str, month: str, filename: str) -> str:
+        return f"provider/{provider_id.lower()}/{parameter_type.lower()}/{year}/{month}/{filename}"
 
-    def _resolve_paths(self, data_key: str) -> Tuple[Optional[Path], Optional[Path]]:
-        catalog = self._read_catalog()
-        entry = catalog.get(data_key)
+    def _period(self, metadata: Dict[str, Any]) -> Tuple[str, str]:
+        start = str(metadata.get("start_date") or "2025-01-01")
+        return start[:4], start[5:7] or "01"
+
+    def _resolve_names(self, data_key: str) -> Tuple[Optional[str], Optional[str]]:
+        entry = self._read_catalog().get(data_key)
         if not entry:
-            # Fallback scan in providers dir
-            matches = list(self.providers_dir.glob(f"**/{data_key}.parquet"))
-            if matches:
-                p_path = matches[0]
-                m_path = p_path.with_suffix(".meta.json")
-                return p_path, m_path if m_path.exists() else None
             return None, None
-
-        p_path = Path(entry["storage_path"])
-        m_path = Path(entry["metadata_path"])
-        return p_path, m_path
+        return entry.get("object_name"), entry.get("metadata_object")
 
     def save_dataset(
         self,
@@ -128,27 +113,17 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         df: pd.DataFrame,
         metadata: Dict[str, Any]
     ) -> Tuple[str, int, str]:
-        # Extract year for partitioning
-        year = "2025"
-        if "start_date" in metadata and metadata["start_date"]:
-            year = metadata["start_date"][:4]
+        year, month = self._period(metadata)
+        object_name = self._object_name(provider_id, parameter_type, year, month, f"{data_key}.parquet")
+        metadata_object = self._object_name(provider_id, parameter_type, year, month, f"{data_key}.meta.json")
 
-        folder = self._build_storage_dir(provider_id, parameter_type, year)
-        parquet_path = folder / f"{data_key}.parquet"
-        meta_path = folder / f"{data_key}.meta.json"
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, engine="pyarrow", compression="snappy", index=False)
+        payload = buffer.getvalue()
+        object_store.write_bytes(object_name, payload, "application/vnd.apache.parquet")
 
-        # 1. Save Parquet with snappy compression (standard analytical format)
-        df.to_parquet(parquet_path, engine="pyarrow", compression="snappy", index=False)
-
-        # 2. Compute file size and sha256 checksum
-        file_size = parquet_path.stat().st_size
-        hasher = hashlib.sha256()
-        with open(parquet_path, "rb") as f:
-            while chunk := f.read(65536):
-                hasher.update(chunk)
-        checksum = hasher.hexdigest()
-
-        # 3. Enrich metadata
+        file_size = len(payload)
+        checksum = hashlib.sha256(payload).hexdigest()
         meta_payload = {
             **metadata,
             "data_key": data_key,
@@ -159,22 +134,24 @@ class LocalScalableStorageBackend(BaseStorageBackend):
             "checksum_sha256": checksum,
             "format": "parquet",
             "compression": "snappy",
-            "storage_path": str(parquet_path),
-            "metadata_path": str(meta_path),
-            "gcs_blob_target": f"providers/{provider_id.lower()}/{parameter_type.lower()}/{year}/{data_key}.parquet",
+            "storage_path": object_store.uri(object_name),
+            "metadata_path": object_store.uri(metadata_object),
+            "gcs_blob_target": object_name,
+            "object_name": object_name,
+            "metadata_object": metadata_object,
+            "year": year,
+            "month": month,
             "created_at": pd.Timestamp.now("UTC").isoformat()
         }
-
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_payload, f, indent=2)
+        object_store.write_json(metadata_object, meta_payload)
 
         # 4. Update manifest catalog
         catalog = self._read_catalog()
         catalog[data_key] = meta_payload
         self._write_catalog(catalog)
 
-        logger.info(f"Stored dataset '{data_key}' in scalable format at {parquet_path} ({file_size} bytes)")
-        return str(parquet_path), file_size, checksum
+        logger.info(f"Stored dataset '{data_key}' at {object_store.uri(object_name)} ({file_size} bytes)")
+        return object_store.uri(object_name), file_size, checksum
 
     def read_dataset(self, data_key: str) -> pd.DataFrame:
         meta = self.get_metadata(data_key) or {}
@@ -185,24 +162,32 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         return self._read_parquet(data_key)
 
     def _read_parquet(self, data_key: str) -> pd.DataFrame:
-        p_path, _ = self._resolve_paths(data_key)
-        if not p_path or not p_path.exists():
-            raise PlatformException(f"Dataset '{data_key}' does not exist in storage.", status_code=404)
-        return pd.read_parquet(p_path, engine="pyarrow")
+        object_name, _ = self._resolve_names(data_key)
+        if object_name and object_store.exists(object_name):
+            return pd.read_parquet(io.BytesIO(object_store.read_bytes(object_name)), engine="pyarrow")
+        entry = self._read_catalog().get(data_key) or {}
+        storage_path = entry.get("storage_path")
+        if storage_path and Path(storage_path).exists():
+            return pd.read_parquet(storage_path, engine="pyarrow")
+        raise PlatformException(f"Dataset '{data_key}' does not exist in storage.", status_code=404)
 
     def dataset_exists(self, data_key: str) -> bool:
-        p_path, _ = self._resolve_paths(data_key)
-        return bool(p_path and p_path.exists())
+        object_name, _ = self._resolve_names(data_key)
+        if object_name and object_store.exists(object_name):
+            return True
+        # A catalog entry written before the object store still points at a local file.
+        entry = self._read_catalog().get(data_key) or {}
+        storage_path = entry.get("storage_path")
+        return bool(storage_path and Path(storage_path).exists())
 
     def get_metadata(self, data_key: str) -> Optional[Dict[str, Any]]:
         catalog = self._read_catalog()
         if data_key in catalog:
             return catalog[data_key]
 
-        _, m_path = self._resolve_paths(data_key)
-        if m_path and m_path.exists():
-            with open(m_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        _, metadata_object = self._resolve_names(data_key)
+        if metadata_object and object_store.exists(metadata_object):
+            return object_store.read_json(metadata_object)
         return None
 
     def list_datasets(self, provider_id: Optional[str] = None, parameter_type: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -219,10 +204,14 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         return results
 
     def get_file_path_for_download(self, data_key: str) -> Path:
-        p_path, _ = self._resolve_paths(data_key)
-        if not p_path or not p_path.exists():
+        object_name, _ = self._resolve_names(data_key)
+        if not object_name or not object_store.exists(object_name):
             raise PlatformException(f"Dataset '{data_key}' file not found for download.", status_code=404)
-        return p_path
+        if settings.STORAGE_BACKEND != "gcs":
+            return object_store.root / object_name
+        temp = Path(tempfile.gettempdir()) / f"{data_key}.parquet"
+        temp.write_bytes(object_store.read_bytes(object_name))
+        return temp
 
     def read_dataset_view(self, data_key: str) -> pd.DataFrame:
         """Read one file, or assemble a request view from the files named in catalog.json."""
@@ -237,5 +226,4 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         return f"{settings.API_PREFIX}/datasets/{data_key}/download"
 
 
-# Active storage backend instance (Local scalable, ready to be swapped for GCS)
 storage_backend = LocalScalableStorageBackend()

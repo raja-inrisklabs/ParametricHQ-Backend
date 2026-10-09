@@ -86,6 +86,19 @@ class DatasetService:
             detail="Served directly from central repository (cache hit).",
         )
 
+    def _forget_missing(self, data_key: str) -> None:
+        """Drop a catalog or job record whose file is gone so the request fetches again."""
+        catalog = storage_backend._read_catalog()
+        if data_key in catalog:
+            catalog.pop(data_key, None)
+            storage_backend._write_catalog(catalog)
+        jobs = job_store._read()
+        stale = [job_id for job_id, job in jobs.items() if job.get("data_key") == data_key]
+        if stale:
+            for job_id in stale:
+                jobs.pop(job_id, None)
+            job_store._write(jobs)
+
     def submit_request(self, req: DatasetRequest) -> Tuple[DatasetResponse, int]:
         """Accept a fetch immediately. CDS work runs in the background."""
         data_key = self.generate_data_key(req)
@@ -94,6 +107,7 @@ class DatasetService:
 
         if storage_backend.dataset_exists(data_key):
             return self._ready_from_cache(data_key, requested_vars), 200
+        self._forget_missing(data_key)
 
         if req.is_point():
             extracted = self._extract_point_from_stored_grid(req, data_key, self._catalog_variables(req))
@@ -545,11 +559,10 @@ class DatasetService:
         entry["kind"] = "assembled"
         catalog[data_key] = entry
         storage_backend._write_catalog(catalog)
-        meta_path = entry.get("metadata_path")
-        if meta_path:
-            import json
-            from pathlib import Path
-            Path(meta_path).write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        metadata_object = entry.get("metadata_object")
+        if metadata_object:
+            from app.services.object_store import object_store
+            object_store.write_json(metadata_object, entry)
         return stored
 
     def get_dataset_metadata(self, data_key: str) -> Dict[str, Any]:

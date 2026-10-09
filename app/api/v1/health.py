@@ -14,7 +14,10 @@ def health_check():
     """
     storage_status = "writable"
     try:
-        storage_backend.providers_dir.mkdir(parents=True, exist_ok=True)
+        if settings.STORAGE_BACKEND == "gcs":
+            storage_status = f"gcs:{settings.GCS_BUCKET_NAME}"
+        else:
+            storage_backend.providers_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         storage_status = f"error: {str(e)}"
 
@@ -32,7 +35,7 @@ def health_check():
     catalog = storage_backend.list_datasets()
 
     return {
-        "ok": storage_status == "writable",
+        "ok": not str(storage_status).startswith("error"),
         "app_name": settings.APP_NAME,
         "environment": settings.ENVIRONMENT,
         "storage": storage_status,
