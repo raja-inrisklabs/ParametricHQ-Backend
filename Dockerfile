@@ -12,11 +12,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Create storage directory
-RUN mkdir -p /srv/storage/datasets
+RUN mkdir -p /srv/storage/providers
 
 # Copy application source code
 COPY app ./app
-COPY migrations ./migrations
 
 ENV PORT=8000 \
     PYTHONUNBUFFERED=1 \
