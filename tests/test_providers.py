@@ -1,5 +1,6 @@
 import logging
 
+import pandas as pd
 import pytest
 from app.providers.registry import registry
 from app.providers.era5 import ERA5Provider, _CdsStatusLog
@@ -20,6 +21,23 @@ def test_provider_registry_contains_era5():
     # Check friendly aliases
     assert "rainfall" in era5.supported_parameters
     assert "soil_moisture" in era5.supported_parameters
+
+
+def test_same_year_range_is_one_cds_call():
+    dates = list(pd.date_range("2024-02-01", "2024-08-15", freq="D").to_pydatetime())
+    chunks = ERA5Provider._year_chunks(dates)
+    assert len(chunks) == 1
+    assert chunks[0][0].date().isoformat() == "2024-02-01"
+    assert chunks[0][-1].date().isoformat() == "2024-08-15"
+
+
+def test_cross_year_range_is_one_call_per_year():
+    dates = list(pd.date_range("2023-02-01", "2024-02-01", freq="D").to_pydatetime())
+    chunks = ERA5Provider._year_chunks(dates)
+    assert [chunk[0].year for chunk in chunks] == [2023, 2024]
+    assert chunks[0][-1].date().isoformat() == "2023-12-31"
+    assert chunks[1][0].date().isoformat() == "2024-01-01"
+    assert chunks[1][-1].date().isoformat() == "2024-02-01"
 
 
 def test_era5_variable_catalog():

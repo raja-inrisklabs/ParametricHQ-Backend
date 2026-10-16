@@ -101,6 +101,7 @@ def test_era5_hourly_one_day_stores_all_variables(client):
     meta = client.get(f"/api/v1/datasets/{data_key}")
     assert meta.json()["dataset_name"] == "ERA5-Land"
     assert meta.json()["object_name"].startswith("provider/era5_land/2024/02/")
+    assert meta.json()["month_objects"][0]["object_name"].startswith("provider/era5_land/2024/02/")
 
     again = client.post("/api/v1/datasets/request", json=payload)
     assert again.status_code == 200
@@ -145,6 +146,21 @@ def test_selected_variables_and_range_are_part_of_the_key(client):
     assert "vars_2m_temperature_total_precipitation" in body["data_key"]
     assert "2024-05-01_2024-05-02" in body["data_key"]
     assert body["record_count"] == 11 * 11 * 48 * 2
+    meta = client.get(f"/api/v1/datasets/{body['data_key']}").json()
+    assert meta["month_objects"][0]["object_name"].startswith("provider/era5_land/2024/05/")
+
+    crossing = {
+        **payload,
+        "start_date": "2024-01-31",
+        "end_date": "2024-02-01",
+    }
+    crossing_ready = _wait_for_job(client, crossing)
+    assert crossing_ready.status_code == 200
+    crossing_meta = client.get(f"/api/v1/datasets/{crossing_ready.json()['data_key']}").json()
+    months = {(part["year"], part["month"]) for part in crossing_meta["month_objects"]}
+    assert months == {("2024", "01"), ("2024", "02")}
+    assert any("/2024/01/" in part["object_name"] for part in crossing_meta["month_objects"])
+    assert any("/2024/02/" in part["object_name"] for part in crossing_meta["month_objects"])
 
 
 def test_point_request_uses_one_cell(client):

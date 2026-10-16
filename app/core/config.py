@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # Storage: local files for tests, Google Cloud Storage for the running API.
     STORAGE_BACKEND: str = "gcs"  # 'local' or 'gcs'
     STORAGE_DIR: str = "./storage"
-    GCS_BUCKET_NAME: str = "prametric_hq"
+    GCS_BUCKET_NAME: str = "parametric_hq"
     GOOGLE_CLOUD_PROJECT: str = "testing-41686"
 
     # ERA5 (ECMWF Copernicus Climate Data Store)

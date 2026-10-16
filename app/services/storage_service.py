@@ -105,7 +105,22 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         entry = self._read_catalog().get(data_key)
         if not entry:
             return None, None
+        parts = entry.get("month_objects") or []
+        if parts:
+            return parts[0].get("object_name"), parts[0].get("metadata_object")
         return entry.get("object_name"), entry.get("metadata_object")
+
+    def _month_frames(self, df: pd.DataFrame) -> List[Tuple[str, str, pd.DataFrame]]:
+        """Split rows by the month of timestamp. A range is not stored in the start month."""
+        if df.empty or "timestamp" not in df.columns:
+            return []
+        stamps = pd.to_datetime(df["timestamp"], errors="coerce")
+        grouped: List[Tuple[str, str, pd.DataFrame]] = []
+        periods = stamps.dt.to_period("M")
+        for period in sorted(item for item in periods.dropna().unique()):
+            month_frame = df.loc[periods == period].copy()
+            grouped.append((f"{period.year:04d}", f"{period.month:02d}", month_frame))
+        return grouped
 
     def save_dataset(
         self,
@@ -115,17 +130,39 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         df: pd.DataFrame,
         metadata: Dict[str, Any]
     ) -> Tuple[str, int, str]:
-        year, month = self._period(metadata)
-        object_name = self._object_name(provider_id, parameter_type, year, month, f"{data_key}.parquet")
-        metadata_object = self._object_name(provider_id, parameter_type, year, month, f"{data_key}.meta.json")
+        months = self._month_frames(df)
+        if not months:
+            year, month = self._period(metadata)
+            months = [(year, month, df)]
 
-        buffer = io.BytesIO()
-        df.to_parquet(buffer, engine="pyarrow", compression="snappy", index=False)
-        payload = buffer.getvalue()
-        object_store.write_bytes(object_name, payload, "application/vnd.apache.parquet")
+        month_objects = []
+        payloads = []
+        for year, month, month_frame in months:
+            filename = f"{data_key}_{year}-{month}.parquet"
+            object_name = self._object_name(provider_id, parameter_type, year, month, filename)
+            metadata_object = self._object_name(
+                provider_id, parameter_type, year, month, f"{data_key}_{year}-{month}.meta.json"
+            )
+            buffer = io.BytesIO()
+            month_frame.to_parquet(buffer, engine="pyarrow", compression="snappy", index=False)
+            payload = buffer.getvalue()
+            object_store.write_bytes(object_name, payload, "application/vnd.apache.parquet")
+            payloads.append(payload)
+            month_objects.append({
+                "year": year,
+                "month": month,
+                "record_count": len(month_frame),
+                "file_size_bytes": len(payload),
+                "object_name": object_name,
+                "metadata_object": metadata_object,
+                "storage_path": object_store.uri(object_name),
+            })
 
-        file_size = len(payload)
-        checksum = hashlib.sha256(payload).hexdigest()
+        file_size = sum(len(payload) for payload in payloads)
+        checksum = hashlib.sha256(b"".join(payloads)).hexdigest()
+        first = month_objects[0]
+        object_name = first["object_name"]
+        metadata_object = first["metadata_object"]
         meta_payload = {
             **metadata,
             "data_key": data_key,
@@ -141,18 +178,33 @@ class LocalScalableStorageBackend(BaseStorageBackend):
             "gcs_blob_target": object_name,
             "object_name": object_name,
             "metadata_object": metadata_object,
-            "year": year,
-            "month": month,
+            "month_objects": month_objects,
+            "year": first["year"],
+            "month": first["month"],
             "created_at": pd.Timestamp.now("UTC").isoformat()
         }
-        object_store.write_json(metadata_object, meta_payload)
+        for part in month_objects:
+            part_meta = {
+                **meta_payload,
+                "record_count": part["record_count"],
+                "file_size_bytes": part["file_size_bytes"],
+                "year": part["year"],
+                "month": part["month"],
+                "object_name": part["object_name"],
+                "metadata_object": part["metadata_object"],
+                "storage_path": part["storage_path"],
+                "gcs_blob_target": part["object_name"],
+            }
+            object_store.write_json(part["metadata_object"], part_meta)
 
-        # 4. Update manifest catalog
         catalog = self._read_catalog()
         catalog[data_key] = meta_payload
         self._write_catalog(catalog)
 
-        logger.info(f"Stored dataset '{data_key}' at {object_store.uri(object_name)} ({file_size} bytes)")
+        logger.info(
+            f"Stored dataset '{data_key}' in {len(month_objects)} month folder(s) "
+            f"({file_size} bytes)"
+        )
         return object_store.uri(object_name), file_size, checksum
 
     def read_dataset(self, data_key: str) -> pd.DataFrame:
@@ -161,7 +213,19 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         if parts:
             frames = [self._read_parquet(part) for part in parts]
             return pd.concat(frames, ignore_index=True)
+        month_objects = meta.get("month_objects") or []
+        if len(month_objects) > 1:
+            frames = [self._read_object(part["object_name"]) for part in month_objects]
+            return pd.concat(frames, ignore_index=True)
         return self._read_parquet(data_key)
+
+    def _read_object(self, object_name: str) -> pd.DataFrame:
+        if object_store.exists(object_name):
+            return pd.read_parquet(io.BytesIO(object_store.read_bytes(object_name)), engine="pyarrow")
+        local = object_store.root / object_name
+        if local.exists():
+            return pd.read_parquet(local, engine="pyarrow")
+        raise PlatformException(f"Stored file '{object_name}' was not found.", status_code=404)
 
     def _read_parquet(self, data_key: str) -> pd.DataFrame:
         object_name, _ = self._resolve_names(data_key)
@@ -174,6 +238,10 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         raise PlatformException(f"Dataset '{data_key}' does not exist in storage.", status_code=404)
 
     def dataset_exists(self, data_key: str) -> bool:
+        entry = self._read_catalog().get(data_key) or {}
+        month_objects = entry.get("month_objects") or []
+        if month_objects and all(object_store.exists(part["object_name"]) for part in month_objects):
+            return True
         object_name, _ = self._resolve_names(data_key)
         if object_name and object_store.exists(object_name):
             return True
@@ -206,13 +274,9 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         return results
 
     def get_file_path_for_download(self, data_key: str) -> Path:
-        object_name, _ = self._resolve_names(data_key)
-        if not object_name or not object_store.exists(object_name):
-            raise PlatformException(f"Dataset '{data_key}' file not found for download.", status_code=404)
-        if settings.STORAGE_BACKEND != "gcs":
-            return object_store.root / object_name
+        frame = self.read_dataset(data_key)
         temp = Path(tempfile.gettempdir()) / f"{data_key}.parquet"
-        temp.write_bytes(object_store.read_bytes(object_name))
+        frame.to_parquet(temp, engine="pyarrow", compression="snappy", index=False)
         return temp
 
     def read_dataset_view(self, data_key: str) -> pd.DataFrame:

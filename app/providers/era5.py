@@ -650,11 +650,13 @@ class ERA5Provider(BaseProvider):
         ]
         # Fixed land fields are only added when the user asked for the full catalog.
         invariant = [] if request_variables else (catalog.get("invariant_variables") or [])
-        chunks = self._month_chunks(dates)
+        # One call per year. CDS combines every year, month, and day, so a
+        # 2023-2024 request in one call would also return months outside the range.
+        chunks = self._year_chunks(dates)
         with tempfile.TemporaryDirectory() as tmp_dir:
             frames = []
             for index, chunk in enumerate(chunks, start=1):
-                logger.info(f"CDS month {index}/{len(chunks)}: {chunk[0].date()} to {chunk[-1].date()}")
+                logger.info(f"CDS request {index}/{len(chunks)}: {chunk[0].date()} to {chunk[-1].date()}")
                 query = {
                     "product_type": [catalog["product_type"]],
                     "variable": hourly,
@@ -688,17 +690,23 @@ class ERA5Provider(BaseProvider):
             return wide.loc[keep].reset_index(drop=True)
 
     @staticmethod
-    def _month_chunks(dates: List[datetime.datetime]) -> List[List[datetime.datetime]]:
+    def _year_chunks(dates: List[datetime.datetime]) -> List[List[datetime.datetime]]:
+        """Group a range into one CDS call per calendar year.
+
+        CDS treats year, month, and day as independent lists and returns every
+        combination. A range inside one year can be one call. A range that
+        crosses a year needs one call per year, otherwise the shared month and
+        day lists pull months the user did not ask for.
+        """
         chunks: List[List[datetime.datetime]] = []
         current: List[datetime.datetime] = []
-        current_key = None
+        current_year = None
         for item in dates:
-            key = (item.year, item.month)
-            if current and key != current_key:
+            if current and item.year != current_year:
                 chunks.append(current)
                 current = []
             current.append(item)
-            current_key = key
+            current_year = item.year
         if current:
             chunks.append(current)
         return chunks
