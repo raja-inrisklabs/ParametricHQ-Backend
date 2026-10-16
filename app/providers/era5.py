@@ -616,7 +616,7 @@ class ERA5Provider(BaseProvider):
                 step=float(str(catalog.get("resolution", "0.1deg")).replace("deg", "")),
             )
 
-        return self._to_long_format(wide, variables, units, latitude, longitude)
+        return self._to_long_format(wide, variables, units, latitude, longitude, catalog.get("name") or catalog["id"])
 
     def _fetch_live_catalog_day(
         self,
@@ -947,6 +947,7 @@ class ERA5Provider(BaseProvider):
         units: Dict[str, str],
         latitude: float,
         longitude: float,
+        dataset_name: str = "",
     ) -> pd.DataFrame:
         present = [name for name in variables if name in wide.columns]
         if not present:
@@ -964,4 +965,5 @@ class ERA5Provider(BaseProvider):
             long["longitude"] = longitude
         long["unit"] = long["variable"].map(units)
         long["value"] = pd.to_numeric(long["value"], errors="coerce")
-        return long[["timestamp", "latitude", "longitude", "variable", "value", "unit"]].reset_index(drop=True)
+        long["dataset"] = dataset_name
+        return long[["timestamp", "latitude", "longitude", "dataset", "variable", "value", "unit"]].reset_index(drop=True)

@@ -96,7 +96,11 @@ def test_era5_hourly_one_day_stores_all_variables(client):
     preview = client.get(f"/api/v1/datasets/{data_key}/data?limit=5")
     assert preview.status_code == 200
     row = preview.json()["sample_records"][0]
-    assert set(row) >= {"timestamp", "latitude", "longitude", "variable", "value"}
+    assert set(row) >= {"timestamp", "latitude", "longitude", "dataset", "variable", "value"}
+    assert row["dataset"] == "ERA5-Land"
+    meta = client.get(f"/api/v1/datasets/{data_key}")
+    assert meta.json()["dataset_name"] == "ERA5-Land"
+    assert meta.json()["object_name"].startswith("provider/era5_land/2024/02/")
 
     again = client.post("/api/v1/datasets/request", json=payload)
     assert again.status_code == 200

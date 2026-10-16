@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import re
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -66,8 +67,8 @@ class LocalScalableStorageBackend(BaseStorageBackend):
     Layout:
         catalog.json
         jobs.json
-        provider/{dataset}/{year}/{month}/{data_key}.parquet
-        provider/{dataset}/{year}/{month}/{data_key}.meta.json
+        provider/{dataset_name}/{year}/{month}/{data_key}.parquet
+        provider/{dataset_name}/{year}/{month}/{data_key}.meta.json
     """
 
     def __init__(self, root_dir: Path = None):
@@ -93,7 +94,8 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         object_store.write_json(self.catalog_name, catalog)
 
     def _object_name(self, provider_id: str, parameter_type: str, year: str, month: str, filename: str) -> str:
-        return f"provider/{provider_id.lower()}/{parameter_type.lower()}/{year}/{month}/{filename}"
+        folder = re.sub(r"[^a-z0-9]+", "_", parameter_type.strip().lower()).strip("_") or "dataset"
+        return f"provider/{folder}/{year}/{month}/{filename}"
 
     def _period(self, metadata: Dict[str, Any]) -> Tuple[str, str]:
         start = str(metadata.get("start_date") or "2025-01-01")

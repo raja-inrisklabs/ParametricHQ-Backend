@@ -64,7 +64,6 @@ class DatasetService:
         else:
             joined = "_".join(re.sub(r"[^a-zA-Z0-9_-]", "_", p) for p in requested_params)
             if len(joined) > 40:
-                import hashlib
                 hash_slug = hashlib.md5(joined.encode()).hexdigest()[:8]
                 param_clean = f"multi_{len(requested_params)}vars_{hash_slug}"
             else:
@@ -137,6 +136,14 @@ class DatasetService:
             data_key=data_key,
             detail="Request accepted. Fetch will start shortly.",
         ), 202
+
+    @staticmethod
+    def _dataset_name(req: DatasetRequest) -> str:
+        if req.dataset_id:
+            return get_dataset(req.dataset_id)["name"]
+        if len(req.requested_parameters) == 1:
+            return req.requested_parameters[0]
+        return "multi_parameter"
 
     def _catalog_variables(self, req: DatasetRequest) -> List[str]:
         if not req.dataset_id:
@@ -497,6 +504,10 @@ class DatasetService:
         source_key: Optional[str] = None,
     ) -> DatasetResponse:
         provider = registry.get(req.provider_id)
+        dataset_name = self._dataset_name(req)
+        if "dataset" not in df.columns:
+            df = df.copy()
+            df["dataset"] = dataset_name
         summary = {
             "total_records": len(df),
             "start": str(df["timestamp"].min()) if not df.empty else None,
@@ -524,6 +535,7 @@ class DatasetService:
             "start_date": req.start_date,
             "end_date": req.end_date,
             "dataset_id": req.dataset_id,
+            "dataset_name": dataset_name,
             "resolution": f"{req.grid_step()}deg" if req.dataset_id else (req.resolution or "0.1deg"),
             "temporal_resolution": "hourly",
             "version": req.version or "v1",
@@ -534,7 +546,7 @@ class DatasetService:
         }
         storage_backend.save_dataset(
             provider_id=req.provider_id,
-            parameter_type=req.dataset_id or requested_vars[0],
+            parameter_type=dataset_name,
             data_key=data_key,
             df=df,
             metadata=metadata,

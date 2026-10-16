@@ -104,10 +104,12 @@ def preview_dataset_data(
     meta = storage_backend.get_metadata(data_key) or {}
 
     var_cols = [
-        c for c in df.columns 
-        if c not in ["timestamp", "dt", "latitude", "longitude", "value", "unit", "parameter"]
+        c for c in df.columns
+        if c not in ["timestamp", "dt", "latitude", "longitude", "dataset", "value", "unit", "parameter"]
     ]
-    if not var_cols and "value" in df.columns:
+    if "variable" in df.columns and "value" in df.columns:
+        var_cols = ["value"]
+    elif not var_cols and "value" in df.columns:
         var_cols = ["value"]
 
     summary = {
