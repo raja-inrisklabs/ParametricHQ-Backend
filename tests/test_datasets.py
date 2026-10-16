@@ -212,7 +212,7 @@ def test_point_inside_a_stored_box_is_taken_from_that_grid(client):
     assert body["cached"] is True
     assert "lat23_lon72_" in body["data_key"]
     assert "n24_w70_s22_e74" not in body["data_key"]
-    assert "stored grid" in body["detail"]
+    assert "monthly files" in body["detail"]
     preview = client.get(f"/api/v1/datasets/{body['data_key']}/data?limit=5")
     row = preview.json()["sample_records"][0]
     assert row["latitude"] == 23.0
@@ -278,6 +278,77 @@ def test_missing_variable_is_fetched_into_its_own_file(client):
     assert again.status_code == 200
     assert "Fetched 10m_u_component_of_wind" in again.json()["detail"]
     assert "total_precipitation" not in again.json()["detail"].split("Fetched", 1)[1]
+
+
+def test_month_inside_a_stored_year_is_taken_from_monthly_files(client):
+    year = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23,72",
+        "start_date": "2024-02-01",
+        "end_date": "2024-03-02",
+        "parameters": ["2m_temperature"],
+        "latitude": 23.0,
+        "longitude": 72.0,
+    }
+    stored = _wait_for_job(client, year)
+    assert stored.status_code == 200
+
+    month = {**year, "start_date": "2024-03-01", "end_date": "2024-03-02"}
+    ready = client.post("/api/v1/datasets/request", json=month)
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["cached"] is True
+    assert "monthly files" in body["detail"]
+    assert body["record_count"] == 24 * 2
+    assert "2024-03-01_2024-03-02" in body["data_key"]
+
+    from app.services.storage_service import storage_backend
+    catalog = storage_backend._read_catalog()
+    march = [
+        item for item in catalog["_coverage"].values()
+        if item["month"] == "03"
+        and item["variable"] == "2m_temperature"
+        and item["area_id"].startswith("lat23_lon72")
+    ]
+    assert march
+    assert march[0]["object_name"].startswith("provider/era5_land/2024/03/2m_temperature/lat23_lon72")
+    assert "2024-03-01" in march[0]["days"]
+    assert march[0]["complete"] is False
+
+
+def test_point_inside_a_stored_area_uses_coverage(client):
+    box = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "sample-area",
+        "start_date": "2024-07-01",
+        "end_date": "2024-07-01",
+        "parameters": ["2m_temperature"],
+        "north": 24,
+        "west": 70,
+        "south": 22,
+        "east": 74,
+    }
+    stored = _wait_for_job(client, box)
+    assert stored.status_code == 200
+
+    point = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23.04,72.48",
+        "start_date": "2024-07-01",
+        "end_date": "2024-07-01",
+        "parameters": ["2m_temperature"],
+        "latitude": 23.04,
+        "longitude": 72.48,
+    }
+    ready = client.post("/api/v1/datasets/request", json=point)
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["cached"] is True
+    assert "monthly files" in body["detail"]
+    assert body["record_count"] == 24
 
 
 def test_point_outside_a_stored_box_is_not_taken_from_it(client):

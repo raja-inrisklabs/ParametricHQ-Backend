@@ -1,3 +1,4 @@
+import calendar
 import hashlib
 import io
 import json
@@ -67,8 +68,8 @@ class LocalScalableStorageBackend(BaseStorageBackend):
     Layout:
         catalog.json
         jobs.json
-        provider/{dataset_name}/{year}/{month}/{data_key}.parquet
-        provider/{dataset_name}/{year}/{month}/{data_key}.meta.json
+        provider/{dataset_name}/{year}/{month}/{variable}/{area}.parquet
+        catalog.json holds the request view and the days present in each monthly file.
     """
 
     def __init__(self, root_dir: Path = None):
@@ -93,9 +94,28 @@ class LocalScalableStorageBackend(BaseStorageBackend):
     def _write_catalog(self, catalog: Dict[str, Any]):
         object_store.write_json(self.catalog_name, catalog)
 
+    def _dataset_folder(self, dataset_name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", dataset_name.strip().lower()).strip("_") or "dataset"
+
+    def _variable_folder(self, variable: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]+", "_", variable.strip().lower()).strip("_") or "variable"
+
     def _object_name(self, provider_id: str, parameter_type: str, year: str, month: str, filename: str) -> str:
-        folder = re.sub(r"[^a-z0-9]+", "_", parameter_type.strip().lower()).strip("_") or "dataset"
-        return f"provider/{folder}/{year}/{month}/{filename}"
+        return f"provider/{self._dataset_folder(parameter_type)}/{year}/{month}/{filename}"
+
+    def monthly_object_name(
+        self,
+        dataset_name: str,
+        year: str,
+        month: str,
+        variable: str,
+        area_id: str,
+    ) -> str:
+        """Stable path for one area, one variable, and one month."""
+        return (
+            f"provider/{self._dataset_folder(dataset_name)}/{year}/{month}/"
+            f"{self._variable_folder(variable)}/{area_id}.parquet"
+        )
 
     def _period(self, metadata: Dict[str, Any]) -> Tuple[str, str]:
         start = str(metadata.get("start_date") or "2025-01-01")
@@ -121,6 +141,43 @@ class LocalScalableStorageBackend(BaseStorageBackend):
             month_frame = df.loc[periods == period].copy()
             grouped.append((f"{period.year:04d}", f"{period.month:02d}", month_frame))
         return grouped
+
+    def read_objects(self, object_names: List[str]) -> pd.DataFrame:
+        frames = [self._read_object(name) for name in object_names]
+        frames = [frame for frame in frames if not frame.empty]
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def write_month_file(
+        self,
+        dataset_name: str,
+        year: str,
+        month: str,
+        variable: str,
+        area_id: str,
+        frame: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        """Write or replace one monthly variable file. The catalog records which days it holds."""
+        object_name = self.monthly_object_name(dataset_name, year, month, variable, area_id)
+        buffer = io.BytesIO()
+        frame.to_parquet(buffer, engine="pyarrow", compression="snappy", index=False)
+        payload = buffer.getvalue()
+        object_store.write_bytes(object_name, payload, "application/vnd.apache.parquet")
+        stamps = (
+            pd.to_datetime(frame["timestamp"], errors="coerce")
+            if "timestamp" in frame.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        days = sorted({stamp.strftime("%Y-%m-%d") for stamp in stamps.dropna()})
+        return {
+            "object_name": object_name,
+            "storage_path": object_store.uri(object_name),
+            "record_count": len(frame),
+            "file_size_bytes": len(payload),
+            "checksum_sha256": hashlib.sha256(payload).hexdigest(),
+            "days": days,
+        }
 
     def save_dataset(
         self,
@@ -285,7 +342,22 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         parts = meta.get("assembled_from") or []
         if not parts:
             return self.read_dataset(data_key)
-        frames = [self.read_dataset(part) for part in parts]
+        coverage = self._read_catalog().get("_coverage") or {}
+        object_names = []
+        request_keys = []
+        for part in parts:
+            entry = coverage.get(part)
+            if entry and entry.get("object_name"):
+                object_names.append(entry["object_name"])
+            else:
+                request_keys.append(part)
+        frames = []
+        if object_names:
+            frames.append(self.read_objects(object_names))
+        frames.extend(self.read_dataset(part) for part in request_keys)
+        frames = [frame for frame in frames if not frame.empty]
+        if not frames:
+            return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)
 
     def build_download_url(self, data_key: str) -> str:

@@ -1,3 +1,4 @@
+import calendar
 import hashlib
 import re
 import threading
@@ -107,6 +108,10 @@ class DatasetService:
         if storage_backend.dataset_exists(data_key):
             return self._ready_from_cache(data_key, requested_vars), 200
         self._forget_missing(data_key)
+
+        covered = self._serve_from_coverage(req, data_key, self._catalog_variables(req))
+        if covered:
+            return covered, 200
 
         if req.is_point():
             extracted = self._extract_point_from_stored_grid(req, data_key, self._catalog_variables(req))
@@ -378,6 +383,206 @@ class DatasetService:
         one = req.model_copy(update={"parameters": variables, "fetch_variables": None})
         return self.generate_data_key(one)
 
+    @staticmethod
+    def _place_token(value: float) -> str:
+        return ("%g" % value).replace("-", "m").replace(".", "p")
+
+    def _area_identity(self, req: DatasetRequest) -> Tuple[str, List[float]]:
+        """The stored area. A point is its one snapped grid cell."""
+        if req.is_point():
+            lat, lon = req.snapped_point()
+            half = req.grid_step() / 2
+            bounds = [
+                round(lat + half, 4),
+                round(lon - half, 4),
+                round(lat - half, 4),
+                round(lon + half, 4),
+            ]
+            area_id = f"lat{self._place_token(lat)}_lon{self._place_token(lon)}"
+            return area_id, bounds
+        bounds = [round(float(value), 4) for value in req.cds_area()]
+        area_id = "n{0}_w{1}_s{2}_e{3}".format(*[self._place_token(value) for value in bounds])
+        return area_id, bounds
+
+    @staticmethod
+    def _requested_months(start_date: str, end_date: str) -> List[Tuple[str, str, List[str]]]:
+        months = []
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        cursor = start.replace(day=1)
+        while cursor <= end:
+            year = f"{cursor.year:04d}"
+            month = f"{cursor.month:02d}"
+            last_day = calendar.monthrange(cursor.year, cursor.month)[1]
+            month_start = max(start, cursor)
+            month_end = min(end, cursor.replace(day=last_day))
+            days = [stamp.strftime("%Y-%m-%d") for stamp in pd.date_range(month_start, month_end, freq="D")]
+            months.append((year, month, days))
+            cursor = (cursor + pd.offsets.MonthBegin(1)).normalize()
+        return months
+
+    @staticmethod
+    def _coverage_key(dataset_id: str, variable: str, year: str, month: str, area_id: str) -> str:
+        return f"{dataset_id}|{variable}|{year}-{month}|{area_id}"
+
+    def _coverage_entries(self) -> Dict[str, Dict[str, Any]]:
+        catalog = storage_backend._read_catalog()
+        return catalog.get("_coverage") or {}
+
+    def _find_coverage(
+        self,
+        req: DatasetRequest,
+        variable: str,
+        year: str,
+        month: str,
+        days: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Find a stored area that contains this request and already has these days."""
+        needed = set(days)
+        candidates = []
+        for entry in self._coverage_entries().values():
+            if entry.get("dataset_id") != req.dataset_id or entry.get("variable") != variable:
+                continue
+            if entry.get("year") != year or entry.get("month") != month:
+                continue
+            if not needed <= set(entry.get("days") or []):
+                continue
+            bounds = entry.get("area") or []
+            if len(bounds) != 4:
+                continue
+            if not self._area_contains(bounds, req):
+                continue
+            candidates.append(entry)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda entry: (entry["area"][0] - entry["area"][2]) * (entry["area"][3] - entry["area"][1]))
+        return candidates[0]
+
+    def _area_contains(self, bounds: List[float], req: DatasetRequest) -> bool:
+        north, west, south, east = [float(value) for value in bounds]
+        if req.is_point():
+            lat, lon = req.snapped_point()
+            return south - 0.001 <= lat <= north + 0.001 and west - 0.001 <= lon <= east + 0.001
+        asked = req.cds_area()
+        return (
+            asked[0] <= north + 0.001
+            and asked[2] >= south - 0.001
+            and asked[1] >= west - 0.001
+            and asked[3] <= east + 0.001
+        )
+
+    def _serve_from_coverage(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        requested_vars: List[str],
+    ) -> Optional[DatasetResponse]:
+        """Read a month or point from files that already cover it. Do not call CDS."""
+        if not req.dataset_id or not requested_vars:
+            return None
+        pieces = []
+        sources = []
+        for variable in requested_vars:
+            for year, month, days in self._requested_months(req.start_date, req.end_date):
+                entry = self._find_coverage(req, variable, year, month, days)
+                if not entry:
+                    return None
+                pieces.append(entry["object_name"])
+                sources.append(entry["coverage_key"])
+        frame = storage_backend.read_objects(pieces)
+        frame = self._clip_to_request(req, frame, requested_vars)
+        if frame.empty:
+            return None
+        lat, lon = (req.snapped_point() if req.is_point() else (None, None))
+        if lat is None:
+            lat, lon = req.cds_area()[0], req.cds_area()[1]
+        stored = self._store_view(req, data_key, frame, requested_vars, lat, lon, [])
+        stored.cached = True
+        stored.detail = "Taken from stored monthly files."
+        logger.info(f"{stored.detail} {data_key}")
+        return stored
+
+    def _clip_to_request(self, req: DatasetRequest, frame: pd.DataFrame, variables: List[str]) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        stamps = pd.to_datetime(frame["timestamp"])
+        start = pd.Timestamp(req.start_date)
+        end = pd.Timestamp(req.end_date) + pd.Timedelta(days=1)
+        frame = frame[(stamps >= start) & (stamps < end)].copy()
+        if "variable" in frame.columns:
+            frame = frame[frame["variable"].isin(variables)]
+        if req.is_point() and {"latitude", "longitude"} <= set(frame.columns):
+            lat, lon = req.snapped_point()
+            match_step = 1.0 if settings.ENVIRONMENT == "testing" else req.grid_step()
+            match_lat = round(round(lat / match_step) * match_step, 2)
+            match_lon = round(round(lon / match_step) * match_step, 2)
+            nearest = frame.assign(
+                _distance=(frame["latitude"] - match_lat).abs() + (frame["longitude"] - match_lon).abs()
+            )
+            if nearest.empty:
+                return nearest.drop(columns="_distance")
+            best = nearest["_distance"].min()
+            if best > match_step / 2 + 0.001:
+                return nearest.iloc[0:0].drop(columns="_distance")
+            frame = nearest[nearest["_distance"] == best].drop(columns="_distance")
+            frame["latitude"] = lat
+            frame["longitude"] = lon
+        elif not req.is_point() and {"latitude", "longitude"} <= set(frame.columns):
+            north, west, south, east = req.cds_area()
+            frame = frame[
+                (frame["latitude"] <= north + 0.001)
+                & (frame["latitude"] >= south - 0.001)
+                & (frame["longitude"] >= west - 0.001)
+                & (frame["longitude"] <= east + 0.001)
+            ]
+        return frame.reset_index(drop=True)
+
+    def _record_coverage(self, req: DatasetRequest, frame: pd.DataFrame, variables: List[str]) -> None:
+        """Save each variable and month under a stable area name, and record the days present."""
+        if frame.empty or "timestamp" not in frame.columns:
+            return
+        area_id, bounds = self._area_identity(req)
+        dataset_name = self._dataset_name(req)
+        stamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+        catalog = storage_backend._read_catalog()
+        coverage = catalog.setdefault("_coverage", {})
+        for variable in variables:
+            rows = frame
+            if "variable" in frame.columns:
+                rows = frame[frame["variable"] == variable]
+            if rows.empty:
+                continue
+            periods = stamps.loc[rows.index].dt.to_period("M")
+            for period in sorted(item for item in periods.dropna().unique()):
+                month_rows = rows.loc[periods == period]
+                year = f"{period.year:04d}"
+                month = f"{period.month:02d}"
+                written = storage_backend.write_month_file(
+                    dataset_name, year, month, variable, area_id, month_rows.reset_index(drop=True)
+                )
+                key = self._coverage_key(req.dataset_id, variable, year, month, area_id)
+                existing = coverage.get(key) or {}
+                days = sorted(set(existing.get("days") or []) | set(written["days"]))
+                last_day = calendar.monthrange(period.year, period.month)[1]
+                complete = len(days) >= last_day
+                coverage[key] = {
+                    "coverage_key": key,
+                    "dataset_id": req.dataset_id,
+                    "dataset_name": dataset_name,
+                    "variable": variable,
+                    "year": year,
+                    "month": month,
+                    "area_id": area_id,
+                    "area": bounds,
+                    "days": days,
+                    "complete": complete,
+                    "object_name": written["object_name"],
+                    "record_count": written["record_count"],
+                    "file_size_bytes": written["file_size_bytes"],
+                }
+        catalog["_coverage"] = coverage
+        storage_backend._write_catalog(catalog)
+
     def get_job(self, job_id: str) -> Tuple[DatasetResponse, int]:
         job = job_store.get(job_id)
         if not job:
@@ -469,6 +674,10 @@ class DatasetService:
             lat_override=req.latitude,
             lon_override=req.longitude
         )
+        if req.dataset_id:
+            covered = self._serve_from_coverage(req, data_key, requested_vars)
+            if covered:
+                return covered
         if req.is_point() and req.dataset_id:
             reused = self._extract_point_from_stored_grid(req, data_key, requested_vars)
             if reused:
@@ -487,6 +696,8 @@ class DatasetService:
             raise ProviderError(req.provider_id, str(exc)) from exc
 
         stored = self._store_frame(req, data_key, df, requested_vars, lat, lon)
+        if req.dataset_id:
+            self._record_coverage(req, df, requested_vars)
         if req.is_point():
             self._index_point_file(req, data_key, requested_vars)
         stored.cached = False
