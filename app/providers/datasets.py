@@ -217,6 +217,8 @@ ERA5_LAND_DATASET: Dict[str, Any] = {
     "units": ERA5_LAND_UNITS,
     "short_names": ERA5_LAND_SHORT_NAMES,
     "times": HOURLY_TIMES,
+    # CDS rejects an ERA5-Land request that spans more than one calendar month.
+    "max_request_months": 1,
 }
 
 # CDS names from ERA5 hourly data on single levels.

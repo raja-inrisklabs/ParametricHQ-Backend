@@ -31,6 +31,16 @@ def test_same_year_range_is_one_cds_call():
     assert chunks[0][-1].date().isoformat() == "2024-08-15"
 
 
+def test_land_range_is_one_call_per_month():
+    dates = list(pd.date_range("2024-01-15", "2024-03-02", freq="D").to_pydatetime())
+    chunks = ERA5Provider._request_chunks(dates, 1)
+    assert len(chunks) == 3
+    assert chunks[0][0].date().isoformat() == "2024-01-15"
+    assert chunks[0][-1].date().isoformat() == "2024-01-31"
+    assert chunks[1][0].date().isoformat() == "2024-02-01"
+    assert chunks[2][-1].date().isoformat() == "2024-03-02"
+
+
 def test_cross_year_range_is_one_call_per_year():
     dates = list(pd.date_range("2023-02-01", "2024-02-01", freq="D").to_pydatetime())
     chunks = ERA5Provider._year_chunks(dates)

@@ -1,4 +1,5 @@
 import calendar
+import datetime
 import hashlib
 import re
 import threading
@@ -116,7 +117,10 @@ class DatasetService:
         covered = self._serve_from_coverage(req, data_key, self._catalog_variables(req))
         if covered:
             return covered, 200
-        if req.dataset_id and self._has_partial_coverage(req, self._catalog_variables(req)):
+        if req.dataset_id and (
+            self._has_partial_coverage(req, self._catalog_variables(req))
+            or self._needs_month_split(req)
+        ):
             job_id = uuid.uuid4().hex
             job_store.create(job_id, data_key, req.provider_id)
             threading.Thread(
@@ -129,7 +133,7 @@ class DatasetService:
                 status="accepted",
                 job_id=job_id,
                 data_key=data_key,
-                detail="Request accepted. Missing days will be fetched.",
+                detail=self._accepted_detail(req),
             ), 202
 
         if req.is_point():
@@ -531,6 +535,24 @@ class DatasetService:
                 has_missing = has_missing or any(day not in present for day in days)
         return has_present and has_missing
 
+    def _needs_month_split(self, req: DatasetRequest) -> bool:
+        """ERA5-Land rejects a CDS call that spans more than one calendar month."""
+        if not req.dataset_id:
+            return False
+        limit = int(get_dataset(req.dataset_id).get("max_request_months") or 12)
+        if limit > 1:
+            return False
+        start = datetime.datetime.strptime(req.start_date, "%Y-%m-%d")
+        end = datetime.datetime.strptime(req.end_date, "%Y-%m-%d")
+        return (start.year, start.month) != (end.year, end.month)
+
+    def _accepted_detail(self, req: DatasetRequest) -> str:
+        if self._needs_month_split(req):
+            months = self._requested_months(req.start_date, req.end_date)
+            keys = len(settings.cds_api_keys) or 1
+            return f"Request accepted. {len(months)} months will be fetched across {keys} CDS keys."
+        return "Request accepted. Missing days will be fetched."
+
     def _fill_missing_days(
         self,
         req: DatasetRequest,
@@ -763,10 +785,15 @@ class DatasetService:
     def _run_job(self, job_id: str, req: DatasetRequest) -> None:
         data_key = self.generate_data_key(req)
         try:
+            months = self._requested_months(req.start_date, req.end_date) if self._needs_month_split(req) else []
             job_store.update(
                 job_id,
                 status="running",
-                detail="Fetching from Copernicus CDS.",
+                detail=(
+                    f"Fetching {len(months)} months across {len(settings.cds_api_keys) or 1} CDS keys."
+                    if months
+                    else "Fetching from Copernicus CDS."
+                ),
             )
             response = self._fetch_and_store(req, data_key)
             job_store.update(
@@ -819,6 +846,8 @@ class DatasetService:
             covered = self._serve_from_coverage(req, data_key, requested_vars)
             if covered:
                 return covered
+            if self._needs_month_split(req):
+                return self._fetch_months(req, data_key, requested_vars)
             partial = self._fill_missing_days(req, data_key, requested_vars)
             if partial:
                 return partial
@@ -847,6 +876,77 @@ class DatasetService:
         stored.cached = False
         stored.detail = "Fetched from provider and stored in central repository."
         return stored
+
+    @staticmethod
+    def _contiguous_spans(spans: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """Join months that follow each other. A stored month stays a gap."""
+        if not spans:
+            return []
+        ordered = sorted(spans)
+        groups = [[ordered[0][0], ordered[0][1]]]
+        for start, end in ordered[1:]:
+            previous_end = pd.Timestamp(groups[-1][1])
+            if pd.Timestamp(start) <= previous_end + pd.Timedelta(days=1):
+                groups[-1][1] = end
+            else:
+                groups.append([start, end])
+        return [(start, end) for start, end in groups]
+
+    def _fetch_months(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        requested_vars: List[str],
+    ) -> DatasetResponse:
+        """Fetch each missing month on its own CDS key, and store it as soon as it finishes."""
+        months = self._requested_months(req.start_date, req.end_date)
+        pending = []
+        for year, month, days in months:
+            missing_vars = [
+                variable for variable in requested_vars
+                if not set(days) <= set((self._coverage_for_area(req, variable, year, month) or {}).get("days") or [])
+            ]
+            if missing_vars:
+                pending.append((year, month, days[0], days[-1], missing_vars))
+        if not pending:
+            served = self._serve_from_coverage(req, data_key, requested_vars)
+            if served:
+                return served
+
+        provider = registry.get(req.provider_id)
+        lat, lon = req.snapped_point() if req.is_point() else (req.cds_area()[0], req.cds_area()[1])
+        lock = threading.Lock()
+        progress = {"done": 0, "total": len(pending)}
+
+        def store_chunk(frame: pd.DataFrame) -> None:
+            with lock:
+                self._record_coverage(req, frame, requested_vars)
+                progress["done"] += 1
+                logger.info(f"Stored month {progress['done']}/{progress['total']} for {data_key}")
+
+        logger.info(
+            f"Fetching {len(pending)} months for {data_key} across {len(settings.cds_api_keys) or 1} CDS keys"
+        )
+        groups: Dict[Tuple[str, ...], List[Tuple[str, str]]] = {}
+        for _year, _month, start, end, missing_vars in pending:
+            groups.setdefault(tuple(missing_vars), []).append((start, end))
+        for missing_vars, spans in groups.items():
+            # Keep a hole between stored months out of the CDS call. Each
+            # contiguous span is split into one call per month and run together.
+            for start, end in self._contiguous_spans(spans):
+                slice_request = req.model_copy(update={
+                    "start_date": start,
+                    "end_date": end,
+                    "fetch_variables": list(missing_vars),
+                    "on_chunk": store_chunk,
+                })
+                provider.fetch_data(slice_request, latitude=lat, longitude=lon)
+        served = self._serve_from_coverage(req, data_key, requested_vars)
+        if not served:
+            raise ProviderError(req.provider_id, "Monthly files were fetched but could not be read back.")
+        served.cached = False
+        served.detail = f"Fetched {len(pending)} months and stored them as monthly files."
+        return served
 
     def _store_frame(
         self,

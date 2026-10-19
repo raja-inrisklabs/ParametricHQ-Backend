@@ -1,9 +1,11 @@
 import datetime
-from typing import Optional, Dict, Any, List, Tuple, Union
-from pydantic import BaseModel, Field, model_validator
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DatasetRequest(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     provider_id: str = Field(..., description="Provider identifier (e.g. 'era5')")
     dataset_id: Optional[str] = Field(
         None,
@@ -26,6 +28,11 @@ class DatasetRequest(BaseModel):
     fetch_variables: Optional[List[str]] = Field(
         None,
         description="Subset to retrieve from CDS. Used when the other requested variables are already stored.",
+    )
+    on_chunk: Optional[Callable[[Any], None]] = Field(
+        None,
+        exclude=True,
+        description="Called with each finished month frame so it can be stored before the other months finish.",
     )
     version: Optional[str] = Field("v1", description="Dataset specification version")
     

@@ -1,6 +1,7 @@
 import datetime
 import math
 import hashlib
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
@@ -597,7 +598,14 @@ class ERA5Provider(BaseProvider):
             )
             try:
                 end = datetime.datetime.strptime(request.end_date, "%Y-%m-%d")
-                wide = self._fetch_live_catalog_day(catalog, day, end, request.cds_area(), variables)
+                wide = self._fetch_live_catalog_day(
+                    catalog,
+                    day,
+                    end,
+                    request.cds_area(),
+                    variables,
+                    on_chunk=request.on_chunk,
+                )
             except Exception as exc:
                 logger.error(f"Live CDS call failed: {exc}")
                 raise ProviderError(self.provider_id, f"Copernicus CDS request failed: {exc}") from exc
@@ -625,20 +633,11 @@ class ERA5Provider(BaseProvider):
         end: datetime.datetime,
         area: List[float],
         request_variables: Optional[List[str]] = None,
+        on_chunk=None,
     ) -> pd.DataFrame:
-        import cdsapi
         import tempfile
 
-
-        cds = cdsapi.Client(
-            url=settings.CDSAPI_URL,
-            key=settings.CDSAPI_KEY,
-            quiet=True,
-            progress=False,
-            info_callback=_CdsStatusLog(),
-            warning_callback=lambda *args: logger.warning(_cds_text(*args)),
-            error_callback=lambda *args: logger.error(_cds_text(*args)),
-        )
+        cds = self._cds_client(settings.cds_api_keys[0])
         # Same shape as the official sample: product_type, variable, one day, all hours, area.
         # download_format zip matches the sample. The retrieve target is the zip path.
         dates = [start + datetime.timedelta(days=offset) for offset in range((end - start).days + 1)]
@@ -650,27 +649,14 @@ class ERA5Provider(BaseProvider):
         ]
         # Fixed land fields are only added when the user asked for the full catalog.
         invariant = [] if request_variables else (catalog.get("invariant_variables") or [])
-        # One call per year. CDS combines every year, month, and day, so a
-        # 2023-2024 request in one call would also return months outside the range.
-        chunks = self._year_chunks(dates)
+        # ERA5-Land rejects more than one calendar month, so those chunks run
+        # together, one month on each account key. Other datasets stay one call
+        # per year because CDS combines year, month, and day lists.
+        chunks = self._request_chunks(dates, int(catalog.get("max_request_months") or 12))
         with tempfile.TemporaryDirectory() as tmp_dir:
-            frames = []
-            for index, chunk in enumerate(chunks, start=1):
-                logger.info(f"CDS request {index}/{len(chunks)}: {chunk[0].date()} to {chunk[-1].date()}")
-                query = {
-                    "product_type": [catalog["product_type"]],
-                    "variable": hourly,
-                    "year": sorted({item.strftime("%Y") for item in chunk}),
-                    "month": sorted({item.strftime("%m") for item in chunk}),
-                    "day": sorted({item.strftime("%d") for item in chunk}),
-                    "time": catalog["times"],
-                    "data_format": "netcdf",
-                    "download_format": "zip",
-                    "area": area,
-                }
-                frames.append(
-                    self._retrieve_catalog_frame(cds, catalog, query, Path(tmp_dir) / f"month-{index}", hourly)
-                )
+            frames = self._retrieve_chunks(
+                cds, catalog, chunks, area, hourly, Path(tmp_dir), on_chunk=on_chunk
+            )
             if invariant:
                 fixed_query = {
                     "product_type": [catalog["product_type"]],
@@ -698,18 +684,144 @@ class ERA5Provider(BaseProvider):
         crosses a year needs one call per year, otherwise the shared month and
         day lists pull months the user did not ask for.
         """
+        return ERA5Provider._request_chunks(dates, 12)
+
+    @staticmethod
+    def _request_chunks(dates: List[datetime.datetime], max_months: int) -> List[List[datetime.datetime]]:
+        """Split dates so one CDS call stays inside the dataset's month limit.
+
+        A limit of 1 keeps each call inside one calendar month. ERA5-Land
+        rejects a larger request. A limit of 12 keeps one call per calendar year.
+        """
         chunks: List[List[datetime.datetime]] = []
         current: List[datetime.datetime] = []
-        current_year = None
+        span: set = set()
         for item in dates:
-            if current and item.year != current_year:
+            month_key = (item.year, item.month)
+            if current and (item.year != current[0].year or (max_months <= 1 and month_key not in span)):
                 chunks.append(current)
                 current = []
+                span = set()
+            if current and max_months > 1 and len(span | {month_key}) > max_months:
+                chunks.append(current)
+                current = []
+                span = set()
             current.append(item)
-            current_year = item.year
+            span.add(month_key)
         if current:
             chunks.append(current)
         return chunks
+
+    def _cds_client(self, key: str, quiet: bool = True):
+        import cdsapi
+
+        return cdsapi.Client(
+            url=settings.CDSAPI_URL,
+            key=key,
+            quiet=quiet,
+            progress=False,
+            info_callback=_CdsStatusLog(),
+            warning_callback=lambda *args: logger.warning(_cds_text(*args)),
+            error_callback=lambda *args: logger.error(_cds_text(*args)),
+        )
+
+    def _retrieve_chunks(
+        self,
+        cds,
+        catalog: Dict[str, Any],
+        chunks: List[List[datetime.datetime]],
+        area: List[float],
+        hourly: List[str],
+        folder: Path,
+        on_chunk=None,
+    ) -> List[pd.DataFrame]:
+        """Run month calls together when more than one account key is configured."""
+        keys = settings.cds_api_keys or [settings.CDSAPI_KEY]
+        if len(chunks) <= 1 or len(keys) <= 1:
+            frames = []
+            for index, chunk in enumerate(chunks, start=1):
+                logger.info(f"CDS request {index}/{len(chunks)}: {chunk[0].date()} to {chunk[-1].date()}")
+                frame = self._retrieve_one_chunk(cds, catalog, chunk, area, hourly, folder / f"month-{index}")
+                frames.append(frame)
+                self._emit_chunk(on_chunk, frame, hourly, catalog)
+            return frames
+
+        logger.info(f"CDS parallel months: {len(chunks)} calls across {len(keys)} keys")
+        frames: List[Optional[pd.DataFrame]] = [None] * len(chunks)
+        errors: List[Optional[BaseException]] = [None] * len(chunks)
+        slots = threading.BoundedSemaphore(len(keys))
+
+        def run(index: int, chunk: List[datetime.datetime], key: str) -> None:
+            with slots:
+                label = f"{index + 1}/{len(chunks)}"
+                logger.info(f"CDS request {label}: {chunk[0].date()} to {chunk[-1].date()} on key {index % len(keys) + 1}")
+                try:
+                    client = self._cds_client(key, quiet=False)
+                    frame = self._retrieve_one_chunk(
+                        client, catalog, chunk, area, hourly, folder / f"month-{index + 1}"
+                    )
+                    frames[index] = frame
+                    self._emit_chunk(on_chunk, frame, hourly, catalog)
+                except BaseException as exc:
+                    errors[index] = exc
+                    logger.error(f"CDS request {label} failed: {exc}")
+
+        workers = []
+        for index, chunk in enumerate(chunks):
+            worker = threading.Thread(
+                target=run,
+                args=(index, chunk, keys[index % len(keys)]),
+                name=f"cds-month-{index + 1}",
+                daemon=True,
+            )
+            workers.append(worker)
+            worker.start()
+        for worker in workers:
+            worker.join()
+        failed = next((exc for exc in errors if exc is not None), None)
+        if failed is not None:
+            raise failed
+        return [frame for frame in frames if frame is not None]
+
+    @staticmethod
+    def _emit_chunk(on_chunk, frame: pd.DataFrame, variables: List[str], catalog: Dict[str, Any]) -> None:
+        """Hand one finished month to storage in the same long rows the files use."""
+        if not on_chunk or frame.empty:
+            return
+        if "variable" in frame.columns:
+            on_chunk(frame)
+            return
+        long_frame = ERA5Provider._to_long_format(
+            frame,
+            variables,
+            catalog.get("units") or {},
+            float(frame["latitude"].iloc[0]) if "latitude" in frame.columns else 0.0,
+            float(frame["longitude"].iloc[0]) if "longitude" in frame.columns else 0.0,
+            catalog.get("name") or catalog.get("id") or "",
+        )
+        on_chunk(long_frame)
+
+    def _retrieve_one_chunk(
+        self,
+        cds,
+        catalog: Dict[str, Any],
+        chunk: List[datetime.datetime],
+        area: List[float],
+        hourly: List[str],
+        folder: Path,
+    ) -> pd.DataFrame:
+        query = {
+            "product_type": [catalog["product_type"]],
+            "variable": hourly,
+            "year": sorted({item.strftime("%Y") for item in chunk}),
+            "month": sorted({item.strftime("%m") for item in chunk}),
+            "day": sorted({item.strftime("%d") for item in chunk}),
+            "time": catalog["times"],
+            "data_format": "netcdf",
+            "download_format": "zip",
+            "area": area,
+        }
+        return self._retrieve_catalog_frame(cds, catalog, query, folder, hourly)
 
     def _retrieve_catalog_frame(
         self,

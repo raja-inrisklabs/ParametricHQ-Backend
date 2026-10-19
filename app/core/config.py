@@ -30,6 +30,19 @@ class Settings(BaseSettings):
     CDSAPI_URL: str = "https://cds.climate.copernicus.eu/api"
     CDSAPI_KEY: str = ""
     ERA5_FALLBACK_SIMULATION: bool = True
+    # One CDS account key per parallel month. CDSAPI_KEY is the first key.
+    CDSAPI_KEY_1: str = ""
+    CDSAPI_KEY_2: str = ""
+    CDSAPI_KEY_3: str = ""
+    CDSAPI_KEY_4: str = ""
+    CDSAPI_KEY_5: str = ""
+    CDSAPI_KEY_6: str = ""
+    CDSAPI_KEY_7: str = ""
+    CDSAPI_KEY_8: str = ""
+    CDSAPI_KEY_9: str = ""
+    CDSAPI_KEY_10: str = ""
+    CDSAPI_KEY_11: str = ""
+    CDSAPI_KEY_12: str = ""
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
@@ -48,7 +61,18 @@ class Settings(BaseSettings):
 
     @property
     def has_era5_credentials(self) -> bool:
-        return bool(self.CDSAPI_KEY and self.CDSAPI_KEY.strip())
+        return bool(self.cds_api_keys)
+
+    @property
+    def cds_api_keys(self) -> List[str]:
+        """Keys that can run a month at the same time. Blank and repeated keys are dropped."""
+        names = ["CDSAPI_KEY"] + [f"CDSAPI_KEY_{index}" for index in range(1, 13)]
+        seen = []
+        for name in names:
+            value = str(getattr(self, name, "") or "").strip()
+            if value and value not in seen:
+                seen.append(value)
+        return seen
 
 
 settings = Settings()

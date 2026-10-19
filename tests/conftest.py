@@ -11,10 +11,14 @@ os.environ["ENVIRONMENT"] = "testing"
 os.environ["DEBUG"] = "false"
 os.environ["CDSAPI_KEY"] = ""
 os.environ["ERA5_FALLBACK_SIMULATION"] = "true"
+for _index in range(1, 13):
+    os.environ[f"CDSAPI_KEY_{_index}"] = ""
 
 from app.core.config import settings as _settings
 _settings.CDSAPI_KEY = ""
 _settings.ERA5_FALLBACK_SIMULATION = True
+for _index in range(1, 13):
+    setattr(_settings, f"CDSAPI_KEY_{_index}", "")
 
 # Create a temporary storage directory for tests
 test_dir = tempfile.mkdtemp(prefix="test_parametric_storage_")

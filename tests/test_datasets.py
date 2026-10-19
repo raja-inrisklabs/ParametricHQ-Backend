@@ -351,6 +351,70 @@ def test_missing_variable_is_fetched_into_its_own_file(client):
     assert "total_precipitation" not in again.json()["detail"].split("Fetched", 1)[1]
 
 
+def test_a_year_is_fetched_as_one_call_per_month(client, monkeypatch):
+    calls = []
+
+    def fetch_months(self, catalog, start, end, area, variables, on_chunk=None):
+        dates = list(pd.date_range(start, end, freq="D").to_pydatetime())
+        chunks = self._request_chunks(dates, int(catalog.get("max_request_months") or 12))
+        calls.append([item.date().isoformat() for chunk in chunks for item in (chunk[0], chunk[-1])])
+        frames = []
+        for chunk in chunks:
+            wide = self._simulate_catalog_grid(
+                chunk[0],
+                variables,
+                catalog["units"],
+                area,
+                "23,72",
+                chunk[-1],
+                step=1.0,
+            )
+            frames.append(wide)
+            self._emit_chunk(on_chunk, wide, variables, catalog)
+        return pd.concat(frames, ignore_index=True)
+
+    monkeypatch.setattr("app.providers.era5.ERA5Provider._fetch_live_catalog_day", fetch_months)
+    monkeypatch.setattr("app.core.config.settings.CDSAPI_KEY", "test-key")
+
+    payload = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23,72",
+        "start_date": "2024-11-01",
+        "end_date": "2025-01-02",
+        "parameters": ["2m_temperature"],
+        "latitude": 23.0,
+        "longitude": 72.0,
+    }
+    ready = _wait_for_job(client, payload)
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["cached"] is False
+    assert "3 months" in body["detail"]
+    assert calls == [["2024-11-01", "2024-11-30", "2024-12-01", "2024-12-31", "2025-01-01", "2025-01-02"]]
+
+    from app.services.storage_service import storage_backend
+    coverage = storage_backend._read_catalog()["_coverage"]
+    stored = [
+        item for item in coverage.values()
+        if item["variable"] == "2m_temperature"
+        and item["area_id"].startswith("lat23_lon72")
+        and item["year"] in ("2024", "2025")
+        and not (item["year"] == "2024" and item["month"] < "11")
+    ]
+    assert sorted((item["year"], item["month"]) for item in stored) == [
+        ("2024", "11"),
+        ("2024", "12"),
+        ("2025", "01"),
+    ]
+    assert all(item["object_name"].count("/") >= 5 for item in stored)
+
+    again = client.post("/api/v1/datasets/request", json=payload)
+    assert again.status_code == 200
+    assert again.json()["cached"] is True
+    assert calls == [["2024-11-01", "2024-11-30", "2024-12-01", "2024-12-31", "2025-01-01", "2025-01-02"]]
+
+
 def test_month_inside_a_stored_year_is_taken_from_monthly_files(client):
     year = {
         "provider_id": "era5",
