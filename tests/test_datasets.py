@@ -1,3 +1,6 @@
+import pandas as pd
+
+
 def _wait_for_job(client, payload):
     accepted = client.post("/api/v1/datasets/request", json=payload)
     if accepted.status_code == 200:
@@ -180,6 +183,74 @@ def test_point_request_uses_one_cell(client):
     assert body["record_count"] == 24 * 50
 
 
+def test_overlap_fetches_only_the_missing_days(client):
+    first = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23,72",
+        "start_date": "2024-03-01",
+        "end_date": "2024-03-15",
+        "parameters": ["2m_temperature"],
+        "latitude": 23.0,
+        "longitude": 72.0,
+    }
+    stored = _wait_for_job(client, first)
+    assert stored.status_code == 200
+
+    overlap = {**first, "start_date": "2024-03-10", "end_date": "2024-03-20"}
+    added = _wait_for_job(client, overlap)
+    assert added.status_code == 200
+    assert added.json()["record_count"] == 24 * 11
+
+    from app.services.storage_service import storage_backend
+    march = next(
+        item for item in storage_backend._read_catalog()["_coverage"].values()
+        if item["month"] == "03" and item["area_id"].startswith("lat23_lon72")
+    )
+    assert march["days"][0] == "2024-03-01"
+    assert march["days"][-1] == "2024-03-20"
+    assert len(march["days"]) == 20
+    rows = storage_backend.read_objects([march["object_name"]])
+    days = pd.to_datetime(rows["timestamp"]).dt.strftime("%Y-%m-%d")
+    assert days.nunique() == 20
+    assert len(rows) == 24 * 20
+
+
+def test_a_later_half_month_keeps_the_days_already_stored(client):
+    first = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23,72",
+        "start_date": "2024-03-01",
+        "end_date": "2024-03-15",
+        "parameters": ["2m_temperature"],
+        "latitude": 23.0,
+        "longitude": 72.0,
+    }
+    stored = _wait_for_job(client, first)
+    assert stored.status_code == 200
+
+    second = {**first, "start_date": "2024-03-16", "end_date": "2024-03-30"}
+    added = _wait_for_job(client, second)
+    assert added.status_code == 200
+
+    from app.services.storage_service import storage_backend
+    march = next(
+        item for item in storage_backend._read_catalog()["_coverage"].values()
+        if item["month"] == "03" and item["area_id"].startswith("lat23_lon72")
+    )
+    assert march["days"][0] == "2024-03-01"
+    assert march["days"][-1] == "2024-03-30"
+    assert len(march["days"]) == 30
+    assert march["complete"] is False
+
+    middle = {**first, "start_date": "2024-03-10", "end_date": "2024-03-20"}
+    ready = client.post("/api/v1/datasets/request", json=middle)
+    assert ready.status_code == 200
+    assert ready.json()["cached"] is True
+    assert ready.json()["record_count"] == 24 * 11
+
+
 def test_point_inside_a_stored_box_is_taken_from_that_grid(client):
     box = {
         "provider_id": "era5",
@@ -315,6 +386,16 @@ def test_month_inside_a_stored_year_is_taken_from_monthly_files(client):
     assert march[0]["object_name"].startswith("provider/era5_land/2024/03/2m_temperature/lat23_lon72")
     assert "2024-03-01" in march[0]["days"]
     assert march[0]["complete"] is False
+
+    from app.services.object_store import object_store
+    view = storage_backend.get_metadata(body["data_key"])
+    assert view["kind"] == "view"
+    assert view["source_objects"]
+    assert all("2024-03-01_2024-03-02" not in name for name in view["source_objects"])
+    assert not any("2024-03-01_2024-03-02" in path.name for path in object_store.root.rglob("*.parquet"))
+    download = client.get(f"/api/v1/datasets/{body['data_key']}/download")
+    assert download.status_code == 200
+    assert download.content[:4] == b"PAR1"
 
 
 def test_point_inside_a_stored_area_uses_coverage(client):

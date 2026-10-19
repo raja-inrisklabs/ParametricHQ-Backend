@@ -24,9 +24,12 @@ class ObjectStore:
     def read_text(self, name: str) -> Optional[str]:
         if self.bucket is not None:
             blob = self.bucket.blob(name)
-            if not blob.exists():
+            try:
+                if not blob.exists():
+                    return None
+                return blob.download_as_text(encoding="utf-8")
+            except Exception:
                 return None
-            return blob.download_as_text(encoding="utf-8")
         path = self.root / name
         if not path.exists():
             return None
@@ -53,9 +56,12 @@ class ObjectStore:
         self.write_text(name, json.dumps(payload, indent=2))
 
     def exists(self, name: str) -> bool:
-        if self.bucket is not None:
-            return self.bucket.blob(name).exists()
-        return (self.root / name).exists()
+        try:
+            if self.bucket is not None:
+                return self.bucket.blob(name).exists()
+            return (self.root / name).exists()
+        except Exception:
+            return False
 
     def write_bytes(self, name: str, data: bytes, content_type: str) -> None:
         if self.bucket is not None:

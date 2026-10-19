@@ -158,8 +158,15 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         area_id: str,
         frame: pd.DataFrame,
     ) -> Dict[str, Any]:
-        """Write or replace one monthly variable file. The catalog records which days it holds."""
+        """Add these days to the monthly file. Days already stored stay in the file."""
         object_name = self.monthly_object_name(dataset_name, year, month, variable, area_id)
+        if object_store.exists(object_name):
+            existing = self._read_object(object_name)
+            frame = pd.concat([existing, frame], ignore_index=True)
+            if "timestamp" in frame.columns:
+                frame["_day"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+                identity = [column for column in ("latitude", "longitude", "variable", "_day") if column in frame.columns]
+                frame = frame.drop_duplicates(identity, keep="last").drop(columns="_day")
         buffer = io.BytesIO()
         frame.to_parquet(buffer, engine="pyarrow", compression="snappy", index=False)
         payload = buffer.getvalue()
@@ -266,6 +273,8 @@ class LocalScalableStorageBackend(BaseStorageBackend):
 
     def read_dataset(self, data_key: str) -> pd.DataFrame:
         meta = self.get_metadata(data_key) or {}
+        if meta.get("kind") == "view":
+            return self._read_view(meta)
         parts = meta.get("assembled_from") or []
         if parts:
             frames = [self._read_parquet(part) for part in parts]
@@ -275,6 +284,30 @@ class LocalScalableStorageBackend(BaseStorageBackend):
             frames = [self._read_object(part["object_name"]) for part in month_objects]
             return pd.concat(frames, ignore_index=True)
         return self._read_parquet(data_key)
+
+    def _read_view(self, meta: Dict[str, Any]) -> pd.DataFrame:
+        """Join the monthly files for this request. The joined rows are not stored."""
+        names = meta.get("source_objects") or []
+        if not names:
+            raise PlatformException("This request has no stored monthly files.", status_code=404)
+        frame = self.read_objects(names)
+        if "timestamp" in frame.columns and meta.get("start_date") and meta.get("end_date"):
+            stamps = pd.to_datetime(frame["timestamp"])
+            start = pd.Timestamp(meta["start_date"])
+            end = pd.Timestamp(meta["end_date"]) + pd.Timedelta(days=1)
+            frame = frame[(stamps >= start) & (stamps < end)]
+        if "variable" in frame.columns and meta.get("parameters"):
+            frame = frame[frame["variable"].isin(meta["parameters"])]
+        area = meta.get("area") or []
+        if len(area) == 4 and {"latitude", "longitude"} <= set(frame.columns):
+            north, west, south, east = [float(value) for value in area]
+            frame = frame[
+                (frame["latitude"] <= north + 0.001)
+                & (frame["latitude"] >= south - 0.001)
+                & (frame["longitude"] >= west - 0.001)
+                & (frame["longitude"] <= east + 0.001)
+            ]
+        return frame.reset_index(drop=True)
 
     def _read_object(self, object_name: str) -> pd.DataFrame:
         if object_store.exists(object_name):
@@ -295,7 +328,15 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         raise PlatformException(f"Dataset '{data_key}' does not exist in storage.", status_code=404)
 
     def dataset_exists(self, data_key: str) -> bool:
-        entry = self._read_catalog().get(data_key) or {}
+        try:
+            catalog = self._read_catalog()
+        except Exception as exc:
+            logger.warning(f"Could not read catalog while checking {data_key}: {exc}")
+            return False
+        entry = catalog.get(data_key) or {}
+        source_objects = entry.get("source_objects") or []
+        if entry.get("kind") == "view" and source_objects:
+            return all(object_store.exists(name) for name in source_objects)
         month_objects = entry.get("month_objects") or []
         if month_objects and all(object_store.exists(part["object_name"]) for part in month_objects):
             return True

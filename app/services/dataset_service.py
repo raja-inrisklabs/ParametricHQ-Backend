@@ -13,8 +13,8 @@ from app.schemas.dataset import DatasetRequest, DatasetResponse
 from app.providers.datasets import get_dataset
 from app.providers.registry import registry
 from app.services.job_store import job_store
-from app.services.storage_service import storage_backend
 from app.services.geocoding_service import GeocodingService
+from app.services.storage_service import storage_backend
 
 
 class DatasetService:
@@ -92,7 +92,11 @@ class DatasetService:
         if data_key in catalog:
             catalog.pop(data_key, None)
             storage_backend._write_catalog(catalog)
-        jobs = job_store._read()
+        try:
+            jobs = job_store._read()
+        except Exception as exc:
+            logger.warning(f"Could not read jobs while clearing {data_key}: {exc}")
+            return
         stale = [job_id for job_id, job in jobs.items() if job.get("data_key") == data_key]
         if stale:
             for job_id in stale:
@@ -112,6 +116,21 @@ class DatasetService:
         covered = self._serve_from_coverage(req, data_key, self._catalog_variables(req))
         if covered:
             return covered, 200
+        if req.dataset_id and self._has_partial_coverage(req, self._catalog_variables(req)):
+            job_id = uuid.uuid4().hex
+            job_store.create(job_id, data_key, req.provider_id)
+            threading.Thread(
+                target=self._run_job,
+                args=(job_id, req),
+                name=f"dataset-{job_id[:8]}",
+                daemon=True,
+            ).start()
+            return DatasetResponse(
+                status="accepted",
+                job_id=job_id,
+                data_key=data_key,
+                detail="Request accepted. Missing days will be fetched.",
+            ), 202
 
         if req.is_point():
             extracted = self._extract_point_from_stored_grid(req, data_key, self._catalog_variables(req))
@@ -458,6 +477,97 @@ class DatasetService:
         candidates.sort(key=lambda entry: (entry["area"][0] - entry["area"][2]) * (entry["area"][3] - entry["area"][1]))
         return candidates[0]
 
+    def _coverage_for_area(
+        self,
+        req: DatasetRequest,
+        variable: str,
+        year: str,
+        month: str,
+    ) -> Optional[Dict[str, Any]]:
+        """The stored file for this exact area, even when some requested days are missing."""
+        area_id, _ = self._area_identity(req)
+        key = self._coverage_key(req.dataset_id or "", variable, year, month, area_id)
+        entry = self._coverage_entries().get(key)
+        if entry and entry.get("object_name"):
+            return entry
+        return None
+
+    def _missing_ranges(self, req: DatasetRequest, variables: List[str]) -> List[Tuple[str, str, List[str]]]:
+        """Dates that are missing for at least one requested variable."""
+        missing_days = set()
+        for variable in variables:
+            for year, month, days in self._requested_months(req.start_date, req.end_date):
+                entry = self._coverage_for_area(req, variable, year, month)
+                present = set((entry or {}).get("days") or [])
+                missing_days.update(day for day in days if day not in present)
+        if not missing_days:
+            return []
+        ordered = sorted(missing_days)
+        ranges = []
+        start = previous = ordered[0]
+        group = [start]
+        for day in ordered[1:]:
+            if pd.Timestamp(day) == pd.Timestamp(previous) + pd.Timedelta(days=1):
+                group.append(day)
+            else:
+                ranges.append((start, previous, group))
+                start = day
+                group = [day]
+            previous = day
+        ranges.append((start, previous, group))
+        return ranges
+
+    def _has_partial_coverage(self, req: DatasetRequest, variables: List[str]) -> bool:
+        """Some requested days are stored and some are not, for this exact area."""
+        if not req.dataset_id or not variables:
+            return False
+        has_present = False
+        has_missing = False
+        for variable in variables:
+            for year, month, days in self._requested_months(req.start_date, req.end_date):
+                entry = self._coverage_for_area(req, variable, year, month)
+                present = set((entry or {}).get("days") or [])
+                has_present = has_present or any(day in present for day in days)
+                has_missing = has_missing or any(day not in present for day in days)
+        return has_present and has_missing
+
+    def _fill_missing_days(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        requested_vars: List[str],
+    ) -> Optional[DatasetResponse]:
+        """Fetch only the missing days, then merge them into the monthly files."""
+        ranges = self._missing_ranges(req, requested_vars)
+        if not ranges or not self._has_partial_coverage(req, requested_vars):
+            return None
+        provider = registry.get(req.provider_id)
+        lat, lon = req.snapped_point() if req.is_point() else (req.cds_area()[0], req.cds_area()[1])
+        fetched = []
+        for start, end, _days in ranges:
+            missing_vars = [
+                variable for variable in requested_vars
+                if any(
+                    day not in set((self._coverage_for_area(req, variable, year, month) or {}).get("days") or [])
+                    for year, month, days in self._requested_months(start, end)
+                    for day in days
+                )
+            ]
+            if not missing_vars:
+                continue
+            logger.info(f"Fetching missing days {start} to {end} for {missing_vars}")
+            slice_request = req.model_copy(update={
+                "start_date": start,
+                "end_date": end,
+                "fetch_variables": missing_vars,
+            })
+            fetched.append(provider.fetch_data(slice_request, lat, lon))
+        if not fetched:
+            return None
+        new_rows = pd.concat(fetched, ignore_index=True)
+        self._record_coverage(req, new_rows, requested_vars)
+        return self._serve_from_coverage(req, data_key, requested_vars)
+
     def _area_contains(self, bounds: List[float], req: DatasetRequest) -> bool:
         north, west, south, east = [float(value) for value in bounds]
         if req.is_point():
@@ -493,11 +603,9 @@ class DatasetService:
         frame = self._clip_to_request(req, frame, requested_vars)
         if frame.empty:
             return None
-        lat, lon = (req.snapped_point() if req.is_point() else (None, None))
-        if lat is None:
-            lat, lon = req.cds_area()[0], req.cds_area()[1]
-        stored = self._store_view(req, data_key, frame, requested_vars, lat, lon, [])
-        stored.cached = True
+        # Keep the monthly files. Record where this request reads them from.
+        self._remember_view(req, data_key, frame, requested_vars, pieces)
+        stored = self._ready_from_cache(data_key, requested_vars)
         stored.detail = "Taken from stored monthly files."
         logger.info(f"{stored.detail} {data_key}")
         return stored
@@ -536,6 +644,39 @@ class DatasetService:
                 & (frame["longitude"] <= east + 0.001)
             ]
         return frame.reset_index(drop=True)
+
+    def _remember_view(
+        self,
+        req: DatasetRequest,
+        data_key: str,
+        frame: pd.DataFrame,
+        requested_vars: List[str],
+        object_names: List[str],
+    ) -> None:
+        """Remember a request without writing another copy of the rows."""
+        lat, lon = req.snapped_point() if req.is_point() else (req.cds_area()[0], req.cds_area()[1])
+        area_id, bounds = self._area_identity(req)
+        catalog = storage_backend._read_catalog()
+        catalog[data_key] = {
+            "data_key": data_key,
+            "kind": "view",
+            "provider_id": req.provider_id,
+            "dataset_id": req.dataset_id,
+            "dataset_name": self._dataset_name(req),
+            "parameter_type": self._dataset_name(req),
+            "parameters": requested_vars,
+            "location": req.location,
+            "latitude": lat,
+            "longitude": lon,
+            "area": bounds,
+            "area_id": area_id,
+            "start_date": req.start_date,
+            "end_date": req.end_date,
+            "record_count": len(frame),
+            "source_objects": list(dict.fromkeys(object_names)),
+            "created_at": pd.Timestamp.now("UTC").isoformat(),
+        }
+        storage_backend._write_catalog(catalog)
 
     def _record_coverage(self, req: DatasetRequest, frame: pd.DataFrame, variables: List[str]) -> None:
         """Save each variable and month under a stable area name, and record the days present."""
@@ -678,6 +819,9 @@ class DatasetService:
             covered = self._serve_from_coverage(req, data_key, requested_vars)
             if covered:
                 return covered
+            partial = self._fill_missing_days(req, data_key, requested_vars)
+            if partial:
+                return partial
         if req.is_point() and req.dataset_id:
             reused = self._extract_point_from_stored_grid(req, data_key, requested_vars)
             if reused:
