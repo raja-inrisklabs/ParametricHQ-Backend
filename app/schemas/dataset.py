@@ -66,7 +66,7 @@ class DatasetRequest(BaseModel):
         if (
             self.dataset_id == "reanalysis-era5-land"
             and None not in (self.north, self.south, self.east, self.west)
-            and ((self.north - self.south) > 1 or (self.east - self.west) > 1)
+            and (round(self.north - self.south, 4) > 1 or round(self.east - self.west, 4) > 1)
         ):
             raise ValueError("ERA5-Land area is limited to 1° by 1°. Reduce the area.")
         if self.dataset_id:
@@ -80,10 +80,14 @@ class DatasetRequest(BaseModel):
             if end < start:
                 raise ValueError("end_date must be on or after start_date.")
             day_count = (end - start).days + 1
-            if day_count > 366:
+            from app.providers.datasets import get_dataset
+            yearly = int(get_dataset(self.dataset_id).get("max_request_months") or 1) >= 12
+            if yearly and (end.year - start.year + 1) > 10:
+                raise ValueError("ERA5 single levels can include at most 10 years.")
+            if not yearly and day_count > 366:
                 raise ValueError("Date range is limited to 366 days.")
             selected = self.parameters or []
-            if selected and day_count > 31 and len(selected) > 5:
+            if selected and len(selected) > 5 and (yearly or day_count > 31):
                 raise ValueError("A range longer than 31 days can include at most 5 variables.")
             return self
         if not self.parameters and not self.parameter_type:
@@ -99,9 +103,13 @@ class DatasetRequest(BaseModel):
             raise ValueError("End year must be the same as or after the start year.")
         if self.start_month + self.month_count - 1 > 12:
             raise ValueError("The month range must stay inside the selected year.")
+        from app.providers.datasets import get_dataset
         years = self.end_year - self.start_year + 1
-        calls = years * self.month_count
-        if calls > 12:
+        yearly = int(get_dataset(self.dataset_id).get("max_request_months") or 1) >= 12
+        calls = years if yearly else years * self.month_count
+        if calls > (10 if yearly else 12):
+            if yearly:
+                raise ValueError("ERA5 single levels can include at most 10 years.")
             raise ValueError(
                 f"This selection is {calls} monthly calls. One request can fetch 12 months: "
                 "12 years of 1 month, 6 years of 2 months, or 4 years of 3 months."

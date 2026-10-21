@@ -644,7 +644,10 @@ class ERA5Provider(BaseProvider):
         # Same shape as the official sample: product_type, variable, one day, all hours, area.
         # download_format zip matches the sample. The retrieve target is the zip path.
         dates = self._requested_dates(start, end, catalog)
-        logger.info(f"CDS area [north, west, south, east]={area} days={len(dates)}")
+        logger.info(
+            f"CDS area [north, west, south, east]={area} days={len(dates)} "
+            f"variables={len(request_variables or [])}"
+        )
         # Keep the dataset's native grid. Do not add an interpolation grid.
         hourly = [
             name for name in (catalog.get("hourly_variables") or catalog["variables"])
@@ -769,10 +772,10 @@ class ERA5Provider(BaseProvider):
                 logger.info(f"CDS request {index}/{len(chunks)}: {chunk[0].date()} to {chunk[-1].date()}")
                 frame = self._retrieve_one_chunk(cds, catalog, chunk, area, hourly, folder / f"month-{index}")
                 frames.append(frame)
-                self._emit_chunk(on_chunk, frame, hourly, catalog)
+                self._emit_chunk_months(on_chunk, frame, hourly, catalog)
             return frames
 
-        logger.info(f"CDS parallel months: {len(chunks)} calls across {len(keys)} keys")
+        logger.info(f"CDS parallel calls: {len(chunks)} across {len(keys)} keys")
         frames: List[Optional[pd.DataFrame]] = [None] * len(chunks)
         errors: List[Optional[BaseException]] = [None] * len(chunks)
         slots = threading.BoundedSemaphore(len(keys))
@@ -787,7 +790,7 @@ class ERA5Provider(BaseProvider):
                         client, catalog, chunk, area, hourly, folder / f"month-{index + 1}"
                     )
                     frames[index] = frame
-                    self._emit_chunk(on_chunk, frame, hourly, catalog)
+                    self._emit_chunk_months(on_chunk, frame, hourly, catalog)
                 except BaseException as exc:
                     errors[index] = exc
                     logger.error(f"CDS request {label} failed: {exc}")
@@ -808,6 +811,17 @@ class ERA5Provider(BaseProvider):
         if failed is not None:
             raise failed
         return [frame for frame in frames if frame is not None]
+
+    @staticmethod
+    def _emit_chunk_months(on_chunk, frame: pd.DataFrame, variables: List[str], catalog: Dict[str, Any]) -> None:
+        """Store one calendar month at a time, even when the CDS call held a whole year."""
+        if not on_chunk or frame.empty or "timestamp" not in frame.columns:
+            ERA5Provider._emit_chunk(on_chunk, frame, variables, catalog)
+            return
+        stamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+        periods = stamps.dt.to_period("M")
+        for period in sorted(item for item in periods.dropna().unique()):
+            ERA5Provider._emit_chunk(on_chunk, frame.loc[periods == period].copy(), variables, catalog)
 
     @staticmethod
     def _emit_chunk(on_chunk, frame: pd.DataFrame, variables: List[str], catalog: Dict[str, Any]) -> None:

@@ -121,19 +121,121 @@ def test_area_bounds_are_part_of_the_stored_key(client):
         "location": "custom-box",
         "start_date": "2024-03-02",
         "end_date": "2024-03-02",
-        "north": 24,
-        "west": 68,
-        "south": 20,
-        "east": 74,
+        "north": 23.5,
+        "west": 72.1,
+        "south": 22.5,
+        "east": 73.1,
     }
     ready = _wait_for_job(client, payload)
     assert ready.status_code == 200
     body = ready.json()
-    assert "n24_w68_s20_e74" in body["data_key"]
+    assert "n23p5_w72p1_s22p5_e73p1" in body["data_key"]
     assert "_all_" in body["data_key"]
     meta = client.get(f"/api/v1/datasets/{body['data_key']}")
-    assert meta.json()["area"] == [24.0, 68.0, 20.0, 74.0]
-    assert meta.json()["grid_points"] == 5 * 7
+    assert meta.json()["area"] == [23.5, 72.1, 22.5, 73.1]
+    assert meta.json()["grid_points"] == 2 * 2
+
+
+def test_one_year_sends_only_the_selected_variables(client, monkeypatch):
+    seen = {}
+
+    def fetch_years(self, catalog, start, end, area, variables, on_chunk=None):
+        seen["variables"] = list(variables)
+        wide = self._simulate_catalog_grid(
+            start,
+            variables,
+            catalog["units"],
+            area,
+            "23,72.6",
+            end,
+            step=1.0,
+        )
+        self._emit_chunk_months(on_chunk, wide, variables, catalog)
+        return wide
+
+    monkeypatch.setattr("app.providers.era5.ERA5Provider.is_configured", property(lambda self: True))
+    monkeypatch.setattr("app.providers.era5.ERA5Provider._fetch_live_catalog_day", fetch_years)
+    payload = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-single-levels",
+        "location": "23,72.6",
+        "start_date": "2001-01-01",
+        "end_date": "2001-12-31",
+        "parameters": ["2m_temperature", "2m_dewpoint_temperature", "10m_u_component_of_wind", "10m_v_component_of_wind"],
+        "latitude": 23.0,
+        "longitude": 72.6,
+    }
+    ready = _wait_for_job(client, payload)
+    assert ready.status_code == 200
+    assert seen["variables"] == payload["parameters"]
+
+
+def test_single_levels_fetches_one_call_per_year(client, monkeypatch):
+    calls = []
+
+    def fetch_years(self, catalog, start, end, area, variables, on_chunk=None):
+        dates = self._requested_dates(start, end, catalog)
+        chunks = self._request_chunks(dates, int(catalog.get("max_request_months") or 12))
+        calls.append([(chunk[0].date().isoformat(), chunk[-1].date().isoformat()) for chunk in chunks])
+        frames = []
+        for chunk in chunks:
+            wide = self._simulate_catalog_grid(
+                chunk[0],
+                variables,
+                catalog["units"],
+                area,
+                "23,72.6",
+                chunk[-1],
+                step=1.0,
+            )
+            frames.append(wide)
+            self._emit_chunk_months(on_chunk, wide, variables, catalog)
+        return pd.concat(frames, ignore_index=True)
+
+    monkeypatch.setattr("app.providers.era5.ERA5Provider.is_configured", property(lambda self: True))
+    monkeypatch.setattr("app.providers.era5.ERA5Provider._fetch_live_catalog_day", fetch_years)
+
+    payload = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-single-levels",
+        "location": "23,72.6",
+        "start_date": "2019-01-01",
+        "end_date": "2020-02-02",
+        "parameters": ["2m_temperature"],
+        "latitude": 23.0,
+        "longitude": 72.6,
+    }
+    ready = _wait_for_job(client, payload)
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["cached"] is False
+    assert "2 years" in body["detail"]
+    assert calls == [[("2019-01-01", "2019-12-31"), ("2020-01-01", "2020-02-02")]]
+
+    from app.services.storage_service import storage_backend
+    coverage = storage_backend._read_catalog()["_coverage"]
+    stored = sorted(
+        (item["year"], item["month"])
+        for item in coverage.values()
+        if item.get("dataset_id") == "reanalysis-era5-single-levels"
+        and item.get("area_id") == "lat23_lon72p5"
+        and item.get("year") in ("2019", "2020")
+    )
+    assert ("2019", "01") in stored
+    assert ("2020", "02") in stored
+    assert len(stored) == 14
+    assert all(
+        name.startswith("provider/era5_single_levels/")
+        for name in (
+            item["object_name"]
+            for item in coverage.values()
+            if item.get("dataset_id") == "reanalysis-era5-single-levels"
+        )
+    )
+
+    too_many = {**payload, "end_date": "2029-12-31"}
+    rejected = client.post("/api/v1/datasets/request", json=too_many)
+    assert rejected.status_code == 422
 
 
 def test_era5_land_area_larger_than_one_degree_is_rejected(client):
@@ -224,7 +326,7 @@ def test_overlap_fetches_only_the_missing_days(client):
     from app.services.storage_service import storage_backend
     march = next(
         item for item in storage_backend._read_catalog()["_coverage"].values()
-        if item["month"] == "03" and item["area_id"].startswith("lat23_lon72")
+        if item["month"] == "03" and item["year"] == "2024" and item["area_id"].startswith("lat23_lon72")
     )
     assert march["days"][0] == "2024-03-01"
     assert march["days"][-1] == "2024-03-20"
@@ -256,7 +358,7 @@ def test_a_later_half_month_keeps_the_days_already_stored(client):
     from app.services.storage_service import storage_backend
     march = next(
         item for item in storage_backend._read_catalog()["_coverage"].values()
-        if item["month"] == "03" and item["area_id"].startswith("lat23_lon72")
+        if item["month"] == "03" and item["year"] == "2024" and item["area_id"].startswith("lat23_lon72")
     )
     assert march["days"][0] == "2024-03-01"
     assert march["days"][-1] == "2024-03-30"
@@ -278,10 +380,10 @@ def test_point_inside_a_stored_box_is_taken_from_that_grid(client):
         "start_date": "2024-06-03",
         "end_date": "2024-06-03",
         "parameters": ["2m_temperature"],
-        "north": 24,
-        "west": 70,
-        "south": 22,
-        "east": 74,
+        "north": 23.5,
+        "west": 72.0,
+        "south": 22.5,
+        "east": 73.0,
     }
     stored = _wait_for_job(client, box)
     assert stored.status_code == 200
@@ -317,10 +419,10 @@ def test_missing_variable_is_fetched_into_its_own_file(client):
         "start_date": "2024-02-01",
         "end_date": "2024-02-01",
         "parameters": ["2m_temperature"],
-        "north": 24,
-        "west": 70,
-        "south": 22,
-        "east": 74,
+        "north": 23.5,
+        "west": 72.0,
+        "south": 22.5,
+        "east": 73.0,
     }
     stored = _wait_for_job(client, box)
     assert stored.status_code == 200
@@ -477,14 +579,17 @@ def test_a_season_fetches_those_months_in_each_year(client, monkeypatch):
     body = ready.json()
     assert body["cached"] is False
     assert "4 months" in body["detail"]
-    assert calls == [["2018-06-01", "2018-07-01", "2019-06-01", "2019-07-01"]]
+    assert calls == [["2018-06-01", "2018-07-01"], ["2019-06-01", "2019-07-01"]]
 
     from app.services.storage_service import storage_backend
     coverage = storage_backend._read_catalog()["_coverage"]
     stored = sorted(
         (item["year"], item["month"])
         for item in coverage.values()
-        if item["variable"] == "2m_temperature" and item["year"] in ("2018", "2019")
+        if item.get("dataset_id") == "reanalysis-era5-land"
+        and item["variable"] == "2m_temperature"
+        and item["area_id"].startswith("lat23_lon72")
+        and item["year"] in ("2018", "2019")
     )
     assert stored == [("2018", "06"), ("2018", "07"), ("2019", "06"), ("2019", "07")]
     download = client.get(f"/api/v1/datasets/{body['data_key']}/download")
@@ -496,7 +601,7 @@ def test_a_season_fetches_those_months_in_each_year(client, monkeypatch):
     again = client.post("/api/v1/datasets/request", json=payload)
     assert again.status_code == 200
     assert again.json()["cached"] is True
-    assert len(calls) == 1
+    assert calls == [["2018-06-01", "2018-07-01"], ["2019-06-01", "2019-07-01"]]
 
     too_many = {**payload, "end_year": 2025}
     rejected = client.post("/api/v1/datasets/request", json=too_many)
@@ -531,6 +636,7 @@ def test_month_inside_a_stored_year_is_taken_from_monthly_files(client):
     march = [
         item for item in catalog["_coverage"].values()
         if item["month"] == "03"
+        and item["year"] == "2024"
         and item["variable"] == "2m_temperature"
         and item["area_id"].startswith("lat23_lon72")
     ]
@@ -558,10 +664,10 @@ def test_point_inside_a_stored_area_uses_coverage(client):
         "start_date": "2024-07-01",
         "end_date": "2024-07-01",
         "parameters": ["2m_temperature"],
-        "north": 24,
-        "west": 70,
-        "south": 22,
-        "east": 74,
+        "north": 23.5,
+        "west": 72.0,
+        "south": 22.5,
+        "east": 73.0,
     }
     stored = _wait_for_job(client, box)
     assert stored.status_code == 200
@@ -592,10 +698,10 @@ def test_point_outside_a_stored_box_is_not_taken_from_it(client):
         "start_date": "2024-06-04",
         "end_date": "2024-06-04",
         "parameters": ["2m_temperature"],
-        "north": 24,
-        "west": 70,
-        "south": 22,
-        "east": 74,
+        "north": 23.5,
+        "west": 72.0,
+        "south": 22.5,
+        "east": 73.0,
     }
     stored = _wait_for_job(client, box)
     assert stored.status_code == 200

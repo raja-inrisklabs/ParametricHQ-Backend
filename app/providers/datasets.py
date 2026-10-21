@@ -996,6 +996,9 @@ ERA5_SINGLE_LEVELS_DATASET: Dict[str, Any] = {
     "units": ERA5_SINGLE_LEVELS_UNITS,
     "short_names": ERA5_SINGLE_LEVELS_SHORT_NAMES,
     "times": HOURLY_TIMES,
+    # One CDS call can hold a calendar year. Ten years run together, one key each.
+    "max_request_months": 12,
+    "max_parallel_calls": 10,
 }
 
 DATASETS: Dict[str, Dict[str, Any]] = {
