@@ -1,3 +1,4 @@
+import calendar
 import datetime
 import math
 import hashlib
@@ -582,7 +583,9 @@ class ERA5Provider(BaseProvider):
         longitude: float,
     ) -> pd.DataFrame:
         """One calendar day of hourly ERA5, every catalog variable, long format."""
-        catalog = get_dataset(request.dataset_id or "")
+        catalog = dict(get_dataset(request.dataset_id or ""))
+        if request.period_type == "season":
+            catalog["season_window"] = (request.start_month, request.month_count)
         day = datetime.datetime.strptime(request.start_date, "%Y-%m-%d")
         available = list(catalog.get("hourly_variables") or catalog["variables"])
         selected = [name for name in (request.parameters or []) if name in available]
@@ -640,7 +643,7 @@ class ERA5Provider(BaseProvider):
         cds = self._cds_client(settings.cds_api_keys[0])
         # Same shape as the official sample: product_type, variable, one day, all hours, area.
         # download_format zip matches the sample. The retrieve target is the zip path.
-        dates = [start + datetime.timedelta(days=offset) for offset in range((end - start).days + 1)]
+        dates = self._requested_dates(start, end, catalog)
         logger.info(f"CDS area [north, west, south, east]={area} days={len(dates)}")
         # Keep the dataset's native grid. Do not add an interpolation grid.
         hourly = [
@@ -672,8 +675,31 @@ class ERA5Provider(BaseProvider):
                 frames.append(self._retrieve_catalog_frame(cds, catalog, fixed_query, Path(tmp_dir) / "fixed", invariant))
             wide = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             stamps = pd.to_datetime(wide["timestamp"])
-            keep = (stamps >= pd.Timestamp(start)) & (stamps < pd.Timestamp(end) + pd.Timedelta(days=1))
+            selected = {(item.year, item.month, item.day) for item in dates}
+            keep = stamps.map(lambda stamp: (stamp.year, stamp.month, stamp.day) in selected)
             return wide.loc[keep].reset_index(drop=True)
+
+    @staticmethod
+    def _requested_dates(
+        start: datetime.datetime,
+        end: datetime.datetime,
+        catalog: Dict[str, Any],
+    ) -> List[datetime.datetime]:
+        """Dates inside the call. A seasonal window repeats in each year and skips the gap."""
+        window = catalog.get("season_window")
+        if window:
+            start_month, month_count = window
+            dates = []
+            for year in range(start.year, end.year + 1):
+                for offset in range(month_count):
+                    month = start_month + offset
+                    last_day = calendar.monthrange(year, month)[1]
+                    dates.extend(
+                        datetime.datetime(year, month, day)
+                        for day in range(1, last_day + 1)
+                    )
+            return dates
+        return [start + datetime.timedelta(days=offset) for offset in range((end - start).days + 1)]
 
     @staticmethod
     def _year_chunks(dates: List[datetime.datetime]) -> List[List[datetime.datetime]]:

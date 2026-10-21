@@ -293,9 +293,18 @@ class LocalScalableStorageBackend(BaseStorageBackend):
         frame = self.read_objects(names)
         if "timestamp" in frame.columns and meta.get("start_date") and meta.get("end_date"):
             stamps = pd.to_datetime(frame["timestamp"])
-            start = pd.Timestamp(meta["start_date"])
-            end = pd.Timestamp(meta["end_date"]) + pd.Timedelta(days=1)
-            frame = frame[(stamps >= start) & (stamps < end)]
+            if meta.get("period_type") == "season" and meta.get("start_month") and meta.get("month_count"):
+                selected = {
+                    (year, meta["start_month"] + offset)
+                    for year in range(int(meta["start_year"]), int(meta["end_year"]) + 1)
+                    for offset in range(int(meta["month_count"]))
+                }
+                keep = stamps.map(lambda stamp: (stamp.year, stamp.month) in selected)
+            else:
+                start = pd.Timestamp(meta["start_date"])
+                end = pd.Timestamp(meta["end_date"]) + pd.Timedelta(days=1)
+                keep = (stamps >= start) & (stamps < end)
+            frame = frame.loc[keep]
         if "variable" in frame.columns and meta.get("parameters"):
             frame = frame[frame["variable"].isin(meta["parameters"])]
         area = meta.get("area") or []

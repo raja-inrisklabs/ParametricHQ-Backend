@@ -1,3 +1,4 @@
+import calendar
 import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -20,8 +21,16 @@ class DatasetRequest(BaseModel):
         description="List of multiple parameters to fetch simultaneously, e.g. ['2m_temperature', 'total_precipitation', 'volumetric_soil_water_layer_1']"
     )
     location: str = Field(..., description="Target location name (e.g. 'gujarat/ahmedabad') or 'lat,lon'")
-    start_date: str = Field(..., description="Start date in YYYY-MM-DD format")
-    end_date: str = Field(..., description="End date in YYYY-MM-DD format")
+    start_date: Optional[str] = Field(None, description="Start date in YYYY-MM-DD format")
+    end_date: Optional[str] = Field(None, description="End date in YYYY-MM-DD format")
+    period_type: Optional[str] = Field(
+        None,
+        description="'dates' for a start and end date, or 'season' for the same months in each year.",
+    )
+    start_month: Optional[int] = Field(None, ge=1, le=12, description="First month of a seasonal window.")
+    month_count: Optional[int] = Field(None, ge=1, le=3, description="How many months, starting at start_month.")
+    start_year: Optional[int] = Field(None, ge=1940, le=2100)
+    end_year: Optional[int] = Field(None, ge=1940, le=2100)
     resolution: Optional[str] = Field("0.1deg", description="Resolution (e.g., '0.1deg' for ERA5-Land, '0.25deg' for ERA5)")
     temporal_resolution: Optional[str] = Field("hourly", description="'hourly' (24 readings/day) or 'daily'")
     hours: Optional[List[str]] = Field(None, description="Optional specific hours, e.g. ['00:00', '06:00', '12:00', '18:00'] or default all 24 hours")
@@ -54,7 +63,18 @@ class DatasetRequest(BaseModel):
             raise ValueError("North must be greater than south.")
         if self.west is not None and self.east is not None and self.west >= self.east:
             raise ValueError("West must be less than east.")
+        if (
+            self.dataset_id == "reanalysis-era5-land"
+            and None not in (self.north, self.south, self.east, self.west)
+            and ((self.north - self.south) > 1 or (self.east - self.west) > 1)
+        ):
+            raise ValueError("ERA5-Land area is limited to 1° by 1°. Reduce the area.")
         if self.dataset_id:
+            if self.period_type == "season":
+                self._validate_season()
+                return self
+            if not self.start_date or not self.end_date:
+                raise ValueError("Select a start date and an end date.")
             start = datetime.datetime.strptime(self.start_date, "%Y-%m-%d")
             end = datetime.datetime.strptime(self.end_date, "%Y-%m-%d")
             if end < start:
@@ -71,6 +91,46 @@ class DatasetRequest(BaseModel):
         if self.parameters and not self.parameter_type:
             self.parameter_type = self.parameters[0] if len(self.parameters) == 1 else "multi_parameter"
         return self
+
+    def _validate_season(self) -> None:
+        if not all(value is not None for value in (self.start_month, self.month_count, self.start_year, self.end_year)):
+            raise ValueError("A month range needs a start month, a month count, a start year, and an end year.")
+        if self.end_year < self.start_year:
+            raise ValueError("End year must be the same as or after the start year.")
+        if self.start_month + self.month_count - 1 > 12:
+            raise ValueError("The month range must stay inside the selected year.")
+        years = self.end_year - self.start_year + 1
+        calls = years * self.month_count
+        if calls > 12:
+            raise ValueError(
+                f"This selection is {calls} monthly calls. One request can fetch 12 months: "
+                "12 years of 1 month, 6 years of 2 months, or 4 years of 3 months."
+            )
+        selected = self.parameters or []
+        if selected and len(selected) > 5:
+            raise ValueError("A month range can include at most 5 variables.")
+        # Dates stay on the request so a view and a download can clip the joined months.
+        self.start_date = f"{self.start_year:04d}-{self.start_month:02d}-01"
+        last_month = self.start_month + self.month_count - 1
+        last_day = calendar.monthrange(self.end_year, last_month)[1]
+        self.end_date = f"{self.end_year:04d}-{last_month:02d}-{last_day:02d}"
+
+    def planned_months(self) -> List[Tuple[str, str, List[str]]]:
+        """Every calendar month this request reads. A season repeats inside each year."""
+        if self.period_type == "season":
+            months = []
+            for year in range(self.start_year, self.end_year + 1):
+                for offset in range(self.month_count):
+                    month = self.start_month + offset
+                    last_day = calendar.monthrange(year, month)[1]
+                    start = datetime.date(year, month, 1)
+                    days = [
+                        (start + datetime.timedelta(days=index)).isoformat()
+                        for index in range(last_day)
+                    ]
+                    months.append((f"{year:04d}", f"{month:02d}", days))
+            return months
+        return []
 
     def is_point(self) -> bool:
         return self.latitude is not None and self.longitude is not None and self.north is None

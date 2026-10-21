@@ -1,3 +1,5 @@
+import io
+
 import pandas as pd
 
 
@@ -134,6 +136,24 @@ def test_area_bounds_are_part_of_the_stored_key(client):
     assert meta.json()["grid_points"] == 5 * 7
 
 
+def test_era5_land_area_larger_than_one_degree_is_rejected(client):
+    payload = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "large-area",
+        "start_date": "2024-05-01",
+        "end_date": "2024-05-02",
+        "parameters": ["2m_temperature"],
+        "north": 23.5,
+        "west": 72.1,
+        "south": 22.4,
+        "east": 73.2,
+    }
+    rejected = client.post("/api/v1/datasets/request", json=payload)
+    assert rejected.status_code == 422
+    assert "Reduce the area" in rejected.text
+
+
 def test_selected_variables_and_range_are_part_of_the_key(client):
     payload = {
         "provider_id": "era5",
@@ -160,10 +180,9 @@ def test_selected_variables_and_range_are_part_of_the_key(client):
     crossing_ready = _wait_for_job(client, crossing)
     assert crossing_ready.status_code == 200
     crossing_meta = client.get(f"/api/v1/datasets/{crossing_ready.json()['data_key']}").json()
-    months = {(part["year"], part["month"]) for part in crossing_meta["month_objects"]}
-    assert months == {("2024", "01"), ("2024", "02")}
-    assert any("/2024/01/" in part["object_name"] for part in crossing_meta["month_objects"])
-    assert any("/2024/02/" in part["object_name"] for part in crossing_meta["month_objects"])
+    sources = crossing_meta["source_objects"]
+    assert any("/2024/01/" in name for name in sources)
+    assert any("/2024/02/" in name for name in sources)
 
 
 def test_point_request_uses_one_cell(client):
@@ -373,8 +392,8 @@ def test_a_year_is_fetched_as_one_call_per_month(client, monkeypatch):
             self._emit_chunk(on_chunk, wide, variables, catalog)
         return pd.concat(frames, ignore_index=True)
 
+    monkeypatch.setattr("app.providers.era5.ERA5Provider.is_configured", property(lambda self: True))
     monkeypatch.setattr("app.providers.era5.ERA5Provider._fetch_live_catalog_day", fetch_months)
-    monkeypatch.setattr("app.core.config.settings.CDSAPI_KEY", "test-key")
 
     payload = {
         "provider_id": "era5",
@@ -413,6 +432,75 @@ def test_a_year_is_fetched_as_one_call_per_month(client, monkeypatch):
     assert again.status_code == 200
     assert again.json()["cached"] is True
     assert calls == [["2024-11-01", "2024-11-30", "2024-12-01", "2024-12-31", "2025-01-01", "2025-01-02"]]
+
+
+def test_a_season_fetches_those_months_in_each_year(client, monkeypatch):
+    calls = []
+
+    def fetch_months(self, catalog, start, end, area, variables, on_chunk=None):
+        dates = self._requested_dates(start, end, catalog)
+        chunks = self._request_chunks(dates, int(catalog.get("max_request_months") or 12))
+        calls.append([chunk[0].date().isoformat() for chunk in chunks])
+        frames = []
+        for chunk in chunks:
+            wide = self._simulate_catalog_grid(
+                chunk[0],
+                variables,
+                catalog["units"],
+                area,
+                "23,72",
+                chunk[-1],
+                step=1.0,
+            )
+            frames.append(wide)
+            self._emit_chunk(on_chunk, wide, variables, catalog)
+        return pd.concat(frames, ignore_index=True)
+
+    monkeypatch.setattr("app.providers.era5.ERA5Provider.is_configured", property(lambda self: True))
+    monkeypatch.setattr("app.providers.era5.ERA5Provider._fetch_live_catalog_day", fetch_months)
+
+    payload = {
+        "provider_id": "era5",
+        "dataset_id": "reanalysis-era5-land",
+        "location": "23,72",
+        "period_type": "season",
+        "start_month": 6,
+        "month_count": 2,
+        "start_year": 2018,
+        "end_year": 2019,
+        "parameters": ["2m_temperature"],
+        "latitude": 23.0,
+        "longitude": 72.0,
+    }
+    ready = _wait_for_job(client, payload)
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["cached"] is False
+    assert "4 months" in body["detail"]
+    assert calls == [["2018-06-01", "2018-07-01", "2019-06-01", "2019-07-01"]]
+
+    from app.services.storage_service import storage_backend
+    coverage = storage_backend._read_catalog()["_coverage"]
+    stored = sorted(
+        (item["year"], item["month"])
+        for item in coverage.values()
+        if item["variable"] == "2m_temperature" and item["year"] in ("2018", "2019")
+    )
+    assert stored == [("2018", "06"), ("2018", "07"), ("2019", "06"), ("2019", "07")]
+    download = client.get(f"/api/v1/datasets/{body['data_key']}/download")
+    assert download.status_code == 200
+    rows = pd.read_parquet(io.BytesIO(download.content))
+    months = sorted(set(pd.to_datetime(rows["timestamp"]).dt.strftime("%Y-%m")))
+    assert months == ["2018-06", "2018-07", "2019-06", "2019-07"]
+
+    again = client.post("/api/v1/datasets/request", json=payload)
+    assert again.status_code == 200
+    assert again.json()["cached"] is True
+    assert len(calls) == 1
+
+    too_many = {**payload, "end_year": 2025}
+    rejected = client.post("/api/v1/datasets/request", json=too_many)
+    assert rejected.status_code == 422
 
 
 def test_month_inside_a_stored_year_is_taken_from_monthly_files(client):

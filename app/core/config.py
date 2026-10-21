@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     @property
     def cds_api_keys(self) -> List[str]:
         """Keys that can run a month at the same time. Blank and repeated keys are dropped."""
+        if self.ENVIRONMENT == "testing":
+            return []
         names = ["CDSAPI_KEY"] + [f"CDSAPI_KEY_{index}" for index in range(1, 13)]
         seen = []
         for name in names:

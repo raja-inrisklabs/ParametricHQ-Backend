@@ -52,8 +52,14 @@ class DatasetService:
             else:
                 digest = hashlib.md5(joined.encode()).hexdigest()[:10]
                 variable_clean = f"vars_{len(selected)}_{digest}"
-            end = req.end_date if req.end_date != req.start_date else req.start_date
-            span = req.start_date if end == req.start_date else f"{req.start_date}_{end}"
+            if req.period_type == "season":
+                span = (
+                    f"m{req.start_month:02d}x{req.month_count}"
+                    f"_{req.start_year}_{req.end_year}"
+                )
+            else:
+                end = req.end_date if req.end_date != req.start_date else req.start_date
+                span = req.start_date if end == req.start_date else f"{req.start_date}_{end}"
             return f"{provider_clean}_{dataset_clean}_{place_clean}_{variable_clean}_{span}_hourly"
 
         res_clean = (req.resolution or "0.1deg").replace(".", "_")
@@ -117,7 +123,7 @@ class DatasetService:
         covered = self._serve_from_coverage(req, data_key, self._catalog_variables(req))
         if covered:
             return covered, 200
-        if req.dataset_id and (
+        if req.dataset_id and req.parameters and (
             self._has_partial_coverage(req, self._catalog_variables(req))
             or self._needs_month_split(req)
         ):
@@ -414,7 +420,7 @@ class DatasetService:
         """The stored area. A point is its one snapped grid cell."""
         if req.is_point():
             lat, lon = req.snapped_point()
-            half = req.grid_step() / 2
+            half = 0.5 if settings.ENVIRONMENT == "testing" else req.grid_step() / 2
             bounds = [
                 round(lat + half, 4),
                 round(lon - half, 4),
@@ -428,7 +434,7 @@ class DatasetService:
         return area_id, bounds
 
     @staticmethod
-    def _requested_months(start_date: str, end_date: str) -> List[Tuple[str, str, List[str]]]:
+    def _months_between(start_date: str, end_date: str) -> List[Tuple[str, str, List[str]]]:
         months = []
         start = pd.Timestamp(start_date)
         end = pd.Timestamp(end_date)
@@ -443,6 +449,13 @@ class DatasetService:
             months.append((year, month, days))
             cursor = (cursor + pd.offsets.MonthBegin(1)).normalize()
         return months
+
+    def _requested_months(self, req: DatasetRequest) -> List[Tuple[str, str, List[str]]]:
+        """The months this request reads. A season does not include the months between years."""
+        planned = req.planned_months()
+        if planned:
+            return planned
+        return self._months_between(req.start_date, req.end_date)
 
     @staticmethod
     def _coverage_key(dataset_id: str, variable: str, year: str, month: str, area_id: str) -> str:
@@ -500,7 +513,7 @@ class DatasetService:
         """Dates that are missing for at least one requested variable."""
         missing_days = set()
         for variable in variables:
-            for year, month, days in self._requested_months(req.start_date, req.end_date):
+            for year, month, days in self._requested_months(req):
                 entry = self._coverage_for_area(req, variable, year, month)
                 present = set((entry or {}).get("days") or [])
                 missing_days.update(day for day in days if day not in present)
@@ -528,7 +541,7 @@ class DatasetService:
         has_present = False
         has_missing = False
         for variable in variables:
-            for year, month, days in self._requested_months(req.start_date, req.end_date):
+            for year, month, days in self._requested_months(req):
                 entry = self._coverage_for_area(req, variable, year, month)
                 present = set((entry or {}).get("days") or [])
                 has_present = has_present or any(day in present for day in days)
@@ -542,13 +555,15 @@ class DatasetService:
         limit = int(get_dataset(req.dataset_id).get("max_request_months") or 12)
         if limit > 1:
             return False
-        start = datetime.datetime.strptime(req.start_date, "%Y-%m-%d")
-        end = datetime.datetime.strptime(req.end_date, "%Y-%m-%d")
-        return (start.year, start.month) != (end.year, end.month)
+        if req.period_type == "season":
+            return True
+        months = self._requested_months(req)
+        # A short span can cross one month boundary and still fit in one CDS call.
+        return len(months) > 1 and sum(len(days) for _year, _month, days in months) > 31
 
     def _accepted_detail(self, req: DatasetRequest) -> str:
         if self._needs_month_split(req):
-            months = self._requested_months(req.start_date, req.end_date)
+            months = self._requested_months(req)
             keys = len(settings.cds_api_keys) or 1
             return f"Request accepted. {len(months)} months will be fetched across {keys} CDS keys."
         return "Request accepted. Missing days will be fetched."
@@ -571,7 +586,7 @@ class DatasetService:
                 variable for variable in requested_vars
                 if any(
                     day not in set((self._coverage_for_area(req, variable, year, month) or {}).get("days") or [])
-                    for year, month, days in self._requested_months(start, end)
+                    for year, month, days in self._months_between(start, end)
                     for day in days
                 )
             ]
@@ -615,7 +630,7 @@ class DatasetService:
         pieces = []
         sources = []
         for variable in requested_vars:
-            for year, month, days in self._requested_months(req.start_date, req.end_date):
+            for year, month, days in self._requested_months(req):
                 entry = self._find_coverage(req, variable, year, month, days)
                 if not entry:
                     return None
@@ -638,7 +653,15 @@ class DatasetService:
         stamps = pd.to_datetime(frame["timestamp"])
         start = pd.Timestamp(req.start_date)
         end = pd.Timestamp(req.end_date) + pd.Timedelta(days=1)
-        frame = frame[(stamps >= start) & (stamps < end)].copy()
+        if req.period_type == "season":
+            selected = {
+                (int(year), int(month))
+                for year, month, _days in self._requested_months(req)
+            }
+            keep = stamps.map(lambda stamp: (stamp.year, stamp.month) in selected)
+        else:
+            keep = (stamps >= start) & (stamps < end)
+        frame = frame.loc[keep].copy()
         if "variable" in frame.columns:
             frame = frame[frame["variable"].isin(variables)]
         if req.is_point() and {"latitude", "longitude"} <= set(frame.columns):
@@ -694,6 +717,11 @@ class DatasetService:
             "area_id": area_id,
             "start_date": req.start_date,
             "end_date": req.end_date,
+            "period_type": req.period_type,
+            "start_month": req.start_month,
+            "month_count": req.month_count,
+            "start_year": req.start_year,
+            "end_year": req.end_year,
             "record_count": len(frame),
             "source_objects": list(dict.fromkeys(object_names)),
             "created_at": pd.Timestamp.now("UTC").isoformat(),
@@ -785,7 +813,7 @@ class DatasetService:
     def _run_job(self, job_id: str, req: DatasetRequest) -> None:
         data_key = self.generate_data_key(req)
         try:
-            months = self._requested_months(req.start_date, req.end_date) if self._needs_month_split(req) else []
+            months = self._requested_months(req) if self._needs_month_split(req) else []
             job_store.update(
                 job_id,
                 status="running",
@@ -846,9 +874,9 @@ class DatasetService:
             covered = self._serve_from_coverage(req, data_key, requested_vars)
             if covered:
                 return covered
-            if self._needs_month_split(req):
+            if req.parameters and self._needs_month_split(req):
                 return self._fetch_months(req, data_key, requested_vars)
-            partial = self._fill_missing_days(req, data_key, requested_vars)
+            partial = self._fill_missing_days(req, data_key, requested_vars) if req.parameters else None
             if partial:
                 return partial
         if req.is_point() and req.dataset_id:
@@ -892,6 +920,14 @@ class DatasetService:
                 groups.append([start, end])
         return [(start, end) for start, end in groups]
 
+    @staticmethod
+    def _fetch_and_record(provider, request, lat, lon, store_chunk, progress) -> None:
+        """Store each finished month. A path that does not call back stores the returned frame."""
+        done_before = progress["done"]
+        frame = provider.fetch_data(request, latitude=lat, longitude=lon)
+        if progress["done"] == done_before and frame is not None and not frame.empty:
+            store_chunk(frame)
+
     def _fetch_months(
         self,
         req: DatasetRequest,
@@ -899,7 +935,7 @@ class DatasetService:
         requested_vars: List[str],
     ) -> DatasetResponse:
         """Fetch each missing month on its own CDS key, and store it as soon as it finishes."""
-        months = self._requested_months(req.start_date, req.end_date)
+        months = self._requested_months(req)
         pending = []
         for year, month, days in months:
             missing_vars = [
@@ -927,20 +963,30 @@ class DatasetService:
         logger.info(
             f"Fetching {len(pending)} months for {data_key} across {len(settings.cds_api_keys) or 1} CDS keys"
         )
-        groups: Dict[Tuple[str, ...], List[Tuple[str, str]]] = {}
-        for _year, _month, start, end, missing_vars in pending:
-            groups.setdefault(tuple(missing_vars), []).append((start, end))
-        for missing_vars, spans in groups.items():
-            # Keep a hole between stored months out of the CDS call. Each
-            # contiguous span is split into one call per month and run together.
-            for start, end in self._contiguous_spans(spans):
-                slice_request = req.model_copy(update={
-                    "start_date": start,
-                    "end_date": end,
-                    "fetch_variables": list(missing_vars),
-                    "on_chunk": store_chunk,
-                })
-                provider.fetch_data(slice_request, latitude=lat, longitude=lon)
+        if req.period_type == "season" and all(item[4] == pending[0][4] for item in pending):
+            # One seasonal call. The provider repeats the month window in each
+            # year and runs those months together, one key per month.
+            slice_request = req.model_copy(update={
+                "fetch_variables": pending[0][4],
+                "on_chunk": store_chunk,
+            })
+            self._fetch_and_record(provider, slice_request, lat, lon, store_chunk, progress)
+        else:
+            groups: Dict[Tuple[str, ...], List[Tuple[str, str]]] = {}
+            for _year, _month, start, end, missing_vars in pending:
+                groups.setdefault(tuple(missing_vars), []).append((start, end))
+            for missing_vars, spans in groups.items():
+                # Keep a hole between stored months out of the CDS call. Each
+                # contiguous span is split into one call per month and run together.
+                for start, end in self._contiguous_spans(spans):
+                    slice_request = req.model_copy(update={
+                        "start_date": start,
+                        "end_date": end,
+                        "period_type": None,
+                        "fetch_variables": list(missing_vars),
+                        "on_chunk": store_chunk,
+                    })
+                    self._fetch_and_record(provider, slice_request, lat, lon, store_chunk, progress)
         served = self._serve_from_coverage(req, data_key, requested_vars)
         if not served:
             raise ProviderError(req.provider_id, "Monthly files were fetched but could not be read back.")
